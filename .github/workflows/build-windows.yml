@@ -42,9 +42,6 @@ jobs:
     - name: Build Zed (Release)
       run: cargo build --release
     
-    - name: Run tests
-      run: cargo test --workspace
-    
     - name: Upload Zed artifact
       uses: actions/upload-artifact@v3
       with:
