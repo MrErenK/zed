@@ -2564,6 +2564,7 @@ dependencies = [
  "anyhow",
  "call",
  "channel",
+ "chrono",
  "client",
  "collections",
  "db",
@@ -3593,6 +3594,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "assets",
+ "chrono",
  "client",
  "clock",
  "collections",
@@ -8105,6 +8107,7 @@ dependencies = [
  "db",
  "editor",
  "file_icons",
+ "futures 0.3.28",
  "git",
  "gpui",
  "language",
@@ -13891,7 +13894,7 @@ dependencies = [
 
 [[package]]
 name = "zed_ruby"
-version = "0.0.6"
+version = "0.0.8"
 dependencies = [
  "zed_extension_api 0.0.6",
 ]
@@ -13941,8 +13944,9 @@ dependencies = [
 
 [[package]]
 name = "zed_vue"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
+ "serde",
  "zed_extension_api 0.0.6",
 ]
 
