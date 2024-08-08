@@ -85,12 +85,8 @@ To do so, add the following to your Zed `settings.json`:
 
 ```json
 {
-  "assistant": {
-    "version": "1",
-    "provider": {
-      "name": "openai",
-      "type": "openai",
-      "default_model": "gpt-4-turbo-preview",
+  "language_models": {
+    "openai": {
       "api_url": "http://localhost:11434/v1"
     }
   }
@@ -103,51 +99,36 @@ The custom URL here is `http://localhost:11434/v1`.
 
 You can use Ollama with the Zed assistant by making Ollama appear as an OpenAPI endpoint.
 
-1. Add the following to your Zed `settings.json`:
+1. Download, for example, the `mistral` model with Ollama:
 
-  ```json
-  {
-    "assistant": {
-      "version": "1",
-      "provider": {
-        "name": "openai",
-        "type": "openai",
-        "default_model": "gpt-4-turbo-preview",
-        "api_url": "http://localhost:11434/v1"
-      }
+   ```
+   ollama pull mistral
+   ```
+
+2. Make sure that the Ollama server is running. You can start it either via running the Ollama app, or launching:
+
+   ```
+   ollama serve
+   ```
+
+3. In the assistant panel, select one of the Ollama models using the model dropdown.
+4. (Optional) If you want to change the default url that is used to access the Ollama server, you can do so by adding the following settings:
+
+```json
+{
+  "language_models": {
+    "ollama": {
+      "api_url": "http://localhost:11434"
     }
   }
-  ```
-2. Download, for example, the `mistral` model with Ollama:
-  ```
-  ollama run mistral
-  ```
-3. Copy the model and change its name to match the model in the Zed `settings.json`:
-  ```
-  ollama cp mistral gpt-4-turbo-preview
-  ```
-4. Use `assistant: reset key` (see the [Setup](#setup) section above) and enter the following API key:
-  ```
-  ollama
-  ```
-5. Restart Zed
+}
+```
 
 ### Using Claude 3.5 Sonnet
 
-You can use Claude with the Zed assistant by adding the following settings:
+You can use Claude with the Zed assistant by choosing it via the model dropdown in the assistant panel.
 
-```json
-"assistant": {
-  "version": "1",
-  "provider": {
-    "default_model": "claude-3-5-sonnet",
-    "name": "anthropic"
-  }
-},
-```
-
-When you save the settings, the assistant panel will open and ask you to add your Anthropic API key.
-You need can obtain this key [here](https://console.anthropic.com/settings/keys).
+You need can obtain an API key [here](https://console.anthropic.com/settings/keys).
 
 Even if you pay for Claude Pro, you will still have to [pay for additional credits](https://console.anthropic.com/settings/plans) to use it via the API.
 
@@ -170,3 +151,80 @@ To create a custom keybinding that prefills a prompt, you can add the following 
   }
 ]
 ```
+
+## Advanced: Overriding prompt templates
+
+Zed allows you to override the default prompts used for various assistant features by placing custom Handlebars (.hbs) templates in your `~/.config/zed/prompts/templates` directory. The following templates can be overridden:
+
+1. `content_prompt.hbs`: Used for generating content in the editor.
+   Format:
+
+   ```handlebars
+   You are an AI programming assistant. Your task is to
+   {{#if is_insert}}insert{{else}}rewrite{{/if}}
+   {{content_type}}{{#if language_name}} in {{language_name}}{{/if}}
+   based on the following context and user request. Context:
+   {{#if is_truncated}}
+     [Content truncated...]
+   {{/if}}
+   {{document_content}}
+   {{#if is_truncated}}
+     [Content truncated...]
+   {{/if}}
+
+   User request:
+   {{user_prompt}}
+
+   {{#if rewrite_section}}
+     Please rewrite the section enclosed in
+     <rewrite_this></rewrite_this>
+     tags.
+   {{else}}
+     Please insert your response at the
+     <insert_here></insert_here>
+     tag.
+   {{/if}}
+
+   Provide only the
+   {{content_type}}
+   content in your response, without any additional explanation.
+   ```
+
+2. `terminal_assistant_prompt.hbs`: Used for the terminal assistant feature.
+   Format:
+
+   ```handlebars
+   You are an AI assistant for a terminal emulator. Provide helpful responses to
+   user queries about terminal commands, file systems, and general computer
+   usage. System information: - Operating System:
+   {{os}}
+   - Architecture:
+   {{arch}}
+   {{#if shell}}
+     - Shell:
+     {{shell}}
+   {{/if}}
+   {{#if working_directory}}
+     - Current Working Directory:
+     {{working_directory}}
+   {{/if}}
+
+   Latest terminal output:
+   {{#each latest_output}}
+     {{this}}
+   {{/each}}
+
+   User query:
+   {{user_prompt}}
+
+   Provide a clear and concise response to the user's query, considering the
+   given system information and latest terminal output if relevant.
+   ```
+
+3. `edit_workflow.hbs`: Used for generating the edit workflow prompt.
+
+4. `step_resolution.hbs`: Used for generating the step resolution prompt.
+
+You can customize these templates to better suit your needs while maintaining the core structure and variables used by Zed. Zed will automatically reload your prompt overrides when they change on disk. Consult Zed's assets/prompts directory for current versions you can play with.
+
+Be sure you want to override these, as you'll miss out on iteration on our built in features. This should be primarily used when developing Zed.
