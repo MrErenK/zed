@@ -7,6 +7,7 @@ jobs:
   build:
     executor:
       name: win/default
+      size: large
       shell: powershell.exe
     steps:
       - checkout
@@ -16,16 +17,23 @@ jobs:
           command: |
             $installer = $env:TEMP + "\rustup-init.exe"
             Invoke-WebRequest https://win.rustup.rs/ -OutFile $installer
-            Start-Process -FilePath $installer -Args "/y" -Wait
-            $rustupPath = "$env:USERPROFILE\.cargo\bin\rustup.exe"
-            & $rustupPath default stable
-            & $rustupPath component add rustfmt clippy
+            Start-Process -FilePath $installer -Args "-y --default-toolchain stable --profile minimal" -Wait
+            $env:Path += ";$env:USERPROFILE\.cargo\bin"
+            rustc --version
+            cargo --version
+            rustup --version
+
+      - run:
+          name: Debug Information
+          command: |
+            Write-Host "Current User: $env:USERNAME"
+            Write-Host "User Profile: $env:USERPROFILE"
+            Write-Host "Current Directory: $(Get-Location)"
+            Write-Host "Rust bin directory exists: $(Test-Path $env:USERPROFILE\.cargo\bin)"
 
       - run:
           name: Add wasm32-wasi target
-          command: |
-            $rustupPath = "$env:USERPROFILE\.cargo\bin\rustup.exe"
-            & $rustupPath target add wasm32-wasi
+          command: rustup target add wasm32-wasi
 
       - run:
           name: Install Visual Studio components
@@ -41,7 +49,7 @@ jobs:
             try {
               Invoke-WebRequest -Uri $downloadUrl -OutFile cache.tar.gz
               if (Test-Path cache.tar.gz) {
-                tar -xzf cache.tar.gz -C C:\Users\circleci\
+                tar -xzf cache.tar.gz -C $env:USERPROFILE
                 Write-Host "Cache downloaded and extracted successfully."
               }
             } catch {
@@ -56,7 +64,7 @@ jobs:
           name: Save cache
           command: |
             $cacheKey = (Get-FileHash -Path Cargo.lock -Algorithm SHA256).Hash
-            tar -czf cache.tar.gz -C C:\Users\circleci\ .cargo\registry .cargo\git target
+            tar -czf cache.tar.gz -C $env:USERPROFILE .cargo\registry .cargo\git target
             curl.exe -X POST https://storage.erensprojects.web.tr/api/upload `
               -H "Content-Type: multipart/form-data" `
               -F "file=@cache.tar.gz" `
