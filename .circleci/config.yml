@@ -17,14 +17,15 @@ jobs:
             $installer = $env:TEMP + "\rustup-init.exe"
             Invoke-WebRequest https://win.rustup.rs/ -OutFile $installer
             Start-Process -FilePath $installer -Args "/y" -Wait
-            $env:Path += ";$env:USERPROFILE\.cargo\bin"
-            [System.Environment]::SetEnvironmentVariable("Path", $env:Path, [System.EnvironmentVariableTarget]::Process)
-            rustup default stable
-            rustup component add rustfmt clippy
+            $rustupPath = "$env:USERPROFILE\.cargo\bin\rustup.exe"
+            & $rustupPath default stable
+            & $rustupPath component add rustfmt clippy
 
       - run:
           name: Add wasm32-wasi target
-          command: rustup target add wasm32-wasi
+          command: |
+            $rustupPath = "$env:USERPROFILE\.cargo\bin\rustup.exe"
+            & $rustupPath target add wasm32-wasi
 
       - run:
           name: Install Visual Studio components
