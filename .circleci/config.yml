@@ -68,11 +68,6 @@ jobs:
               -F "file=@target\release\zed.exe"
 
 workflows:
-  version: 2
   build-workflow:
     jobs:
-      - build:
-          filters:
-            branches:
-              only:
-                - main
+      - build
