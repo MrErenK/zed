@@ -23,12 +23,11 @@ jobs:
             rustup --version
 
       - run:
-          name: Debug Information
+          name: Configure Cargo to use Git CLI
           command: |
-            Write-Host "Current User: $env:USERNAME"
-            Write-Host "User Profile: $env:USERPROFILE"
-            Write-Host "Current Directory: $(Get-Location)"
-            Write-Host "Rust bin directory exists: $(Test-Path $env:USERPROFILE\.cargo\bin)"
+            echo '[net]' >> $env:USERPROFILE\.cargo\config.toml
+            echo 'git-fetch-with-cli = true' >> $env:USERPROFILE\.cargo\config.toml
+
 
       - run:
           name: Add wasm32-wasi target
