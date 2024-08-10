@@ -18,6 +18,7 @@ jobs:
             Invoke-WebRequest https://win.rustup.rs/ -OutFile $installer
             Start-Process -FilePath $installer -Args "/y" -Wait
             $env:Path += ";$env:USERPROFILE\.cargo\bin"
+            [System.Environment]::SetEnvironmentVariable("Path", $env:Path, [System.EnvironmentVariableTarget]::Process)
             rustup default stable
             rustup component add rustfmt clippy
 
