@@ -19,6 +19,7 @@ use fs::Fs;
 use futures::{
     channel::mpsc,
     future::{BoxFuture, LocalBoxFuture},
+    join,
     stream::{self, BoxStream},
     SinkExt, Stream, StreamExt,
 };
@@ -27,7 +28,7 @@ use gpui::{
     FontWeight, Global, HighlightStyle, Model, ModelContext, Subscription, Task, TextStyle,
     UpdateGlobal, View, ViewContext, WeakView, WindowContext,
 };
-use language::{Buffer, IndentKind, Point, Selection, TransactionId};
+use language::{Buffer, IndentKind, Point, TransactionId};
 use language_model::{
     LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage, Role,
 };
@@ -37,7 +38,6 @@ use rope::Rope;
 use settings::Settings;
 use smol::future::FutureExt;
 use std::{
-    cmp,
     future::{self, Future},
     mem,
     ops::{Range, RangeInclusive},
@@ -46,6 +46,7 @@ use std::{
     task::{self, Poll},
     time::{Duration, Instant},
 };
+use text::OffsetRangeExt as _;
 use theme::ThemeSettings;
 use ui::{prelude::*, CheckboxWithLabel, IconButtonShape, Popover, Tooltip};
 use util::{RangeExt, ResultExt};
@@ -58,6 +59,13 @@ pub fn init(
     cx: &mut AppContext,
 ) {
     cx.set_global(InlineAssistant::new(fs, prompt_builder, telemetry));
+    cx.observe_new_views(|_, cx| {
+        let workspace = cx.view().clone();
+        InlineAssistant::update_global(cx, |inline_assistant, cx| {
+            inline_assistant.register_workspace(&workspace, cx)
+        })
+    })
+    .detach();
 }
 
 const PROMPT_HISTORY_MAX_LEN: usize = 20;
@@ -100,6 +108,29 @@ impl InlineAssistant {
         }
     }
 
+    pub fn register_workspace(&mut self, workspace: &View<Workspace>, cx: &mut WindowContext) {
+        cx.subscribe(workspace, |_, event, cx| {
+            Self::update_global(cx, |this, cx| this.handle_workspace_event(event, cx));
+        })
+        .detach();
+    }
+
+    fn handle_workspace_event(&mut self, event: &workspace::Event, cx: &mut WindowContext) {
+        // When the user manually saves an editor, automatically accepts all finished transformations.
+        if let workspace::Event::UserSavedItem { item, .. } = event {
+            if let Some(editor) = item.upgrade().and_then(|item| item.act_as::<Editor>(cx)) {
+                if let Some(editor_assists) = self.assists_by_editor.get(&editor.downgrade()) {
+                    for assist_id in editor_assists.assist_ids.clone() {
+                        let assist = &self.assists[&assist_id];
+                        if let CodegenStatus::Done = &assist.codegen.read(cx).status {
+                            self.finish_assist(assist_id, false, cx)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn assist(
         &mut self,
         editor: &View<Editor>,
@@ -109,66 +140,81 @@ impl InlineAssistant {
         cx: &mut WindowContext,
     ) {
         let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        struct CodegenRange {
+            transform_range: Range<Point>,
+            selection_ranges: Vec<Range<Point>>,
+            focus_assist: bool,
+        }
 
-        let mut selections = Vec::<Selection<Point>>::new();
-        let mut newest_selection = None;
-        for mut selection in editor.read(cx).selections.all::<Point>(cx) {
-            if selection.end > selection.start {
-                selection.start.column = 0;
-                // If the selection ends at the start of the line, we don't want to include it.
-                if selection.end.column == 0 {
-                    selection.end.row -= 1;
-                }
-                selection.end.column = snapshot.line_len(MultiBufferRow(selection.end.row));
+        let newest_selection_range = editor.read(cx).selections.newest::<Point>(cx).range();
+        let mut codegen_ranges: Vec<CodegenRange> = Vec::new();
+
+        let selection_ranges = snapshot
+            .split_ranges(editor.read(cx).selections.disjoint_anchor_ranges())
+            .map(|range| range.to_point(&snapshot))
+            .collect::<Vec<Range<Point>>>();
+
+        for selection_range in selection_ranges {
+            let selection_is_newest = newest_selection_range.contains_inclusive(&selection_range);
+            let mut transform_range = selection_range.start..selection_range.end;
+
+            // Expand the transform range to start/end of lines.
+            // If a non-empty selection ends at the start of the last line, clip at the end of the penultimate line.
+            transform_range.start.column = 0;
+            if transform_range.end.column == 0 && transform_range.end > transform_range.start {
+                transform_range.end.row -= 1;
             }
+            transform_range.end.column = snapshot.line_len(MultiBufferRow(transform_range.end.row));
+            let selection_range =
+                selection_range.start..selection_range.end.min(transform_range.end);
 
-            if let Some(prev_selection) = selections.last_mut() {
-                if selection.start <= prev_selection.end {
-                    prev_selection.end = selection.end;
+            // If we intersect the previous transform range,
+            if let Some(CodegenRange {
+                transform_range: prev_transform_range,
+                selection_ranges,
+                focus_assist,
+            }) = codegen_ranges.last_mut()
+            {
+                if transform_range.start <= prev_transform_range.end {
+                    prev_transform_range.end = transform_range.end;
+                    selection_ranges.push(selection_range);
+                    *focus_assist |= selection_is_newest;
                     continue;
                 }
             }
 
-            let latest_selection = newest_selection.get_or_insert_with(|| selection.clone());
-            if selection.id > latest_selection.id {
-                *latest_selection = selection.clone();
-            }
-            selections.push(selection);
-        }
-        let newest_selection = newest_selection.unwrap();
-
-        let mut codegen_ranges = Vec::new();
-        for (excerpt_id, buffer, buffer_range) in
-            snapshot.excerpts_in_ranges(selections.iter().map(|selection| {
-                snapshot.anchor_before(selection.start)..snapshot.anchor_after(selection.end)
-            }))
-        {
-            let start = Anchor {
-                buffer_id: Some(buffer.remote_id()),
-                excerpt_id,
-                text_anchor: buffer.anchor_before(buffer_range.start),
-            };
-            let end = Anchor {
-                buffer_id: Some(buffer.remote_id()),
-                excerpt_id,
-                text_anchor: buffer.anchor_after(buffer_range.end),
-            };
-            codegen_ranges.push(start..end);
+            codegen_ranges.push(CodegenRange {
+                transform_range,
+                selection_ranges: vec![selection_range],
+                focus_assist: selection_is_newest,
+            })
         }
 
         let assist_group_id = self.next_assist_group_id.post_inc();
         let prompt_buffer =
             cx.new_model(|cx| Buffer::local(initial_prompt.unwrap_or_default(), cx));
         let prompt_buffer = cx.new_model(|cx| MultiBuffer::singleton(prompt_buffer, cx));
-
         let mut assists = Vec::new();
         let mut assist_to_focus = None;
-        for range in codegen_ranges {
-            let assist_id = self.next_assist_id.post_inc();
+
+        for CodegenRange {
+            transform_range,
+            selection_ranges,
+            focus_assist,
+        } in codegen_ranges
+        {
+            let transform_range = snapshot.anchor_before(transform_range.start)
+                ..snapshot.anchor_after(transform_range.end);
+            let selection_ranges = selection_ranges
+                .iter()
+                .map(|range| snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
+                .collect::<Vec<_>>();
+
             let codegen = cx.new_model(|cx| {
                 Codegen::new(
                     editor.read(cx).buffer().clone(),
-                    range.clone(),
+                    transform_range.clone(),
+                    selection_ranges,
                     None,
                     self.telemetry.clone(),
                     self.prompt_builder.clone(),
@@ -176,6 +222,7 @@ impl InlineAssistant {
                 )
             });
 
+            let assist_id = self.next_assist_id.post_inc();
             let gutter_dimensions = Arc::new(Mutex::new(GutterDimensions::default()));
             let prompt_editor = cx.new_view(|cx| {
                 PromptEditor::new(
@@ -192,23 +239,16 @@ impl InlineAssistant {
                 )
             });
 
-            if assist_to_focus.is_none() {
-                let focus_assist = if newest_selection.reversed {
-                    range.start.to_point(&snapshot) == newest_selection.start
-                } else {
-                    range.end.to_point(&snapshot) == newest_selection.end
-                };
-                if focus_assist {
-                    assist_to_focus = Some(assist_id);
-                }
+            if focus_assist {
+                assist_to_focus = Some(assist_id);
             }
 
             let [prompt_block_id, end_block_id] =
-                self.insert_assist_blocks(editor, &range, &prompt_editor, cx);
+                self.insert_assist_blocks(editor, &transform_range, &prompt_editor, cx);
 
             assists.push((
                 assist_id,
-                range,
+                transform_range,
                 prompt_editor,
                 prompt_block_id,
                 end_block_id,
@@ -275,6 +315,7 @@ impl InlineAssistant {
             Codegen::new(
                 editor.read(cx).buffer().clone(),
                 range.clone(),
+                vec![range.clone()],
                 initial_transaction_id,
                 self.telemetry.clone(),
                 self.prompt_builder.clone(),
@@ -498,16 +539,42 @@ impl InlineAssistant {
         if editor.selections.count() == 1 {
             let selection = editor.selections.newest::<usize>(cx);
             let buffer = editor.buffer().read(cx).snapshot(cx);
+            let mut closest_assist_fallback = None;
             for assist_id in &editor_assists.assist_ids {
                 let assist = &self.assists[assist_id];
                 let assist_range = assist.range.to_offset(&buffer);
-                if assist.decorations.is_some()
-                    && assist_range.contains(&selection.start)
-                    && assist_range.contains(&selection.end)
-                {
-                    self.focus_assist(*assist_id, cx);
-                    return;
+                if assist.decorations.is_some() {
+                    if assist_range.contains(&selection.start)
+                        && assist_range.contains(&selection.end)
+                    {
+                        self.focus_assist(*assist_id, cx);
+                        return;
+                    } else {
+                        let distance_from_selection = assist_range
+                            .start
+                            .abs_diff(selection.start)
+                            .min(assist_range.start.abs_diff(selection.end))
+                            + assist_range
+                                .end
+                                .abs_diff(selection.start)
+                                .min(assist_range.end.abs_diff(selection.end));
+                        match closest_assist_fallback {
+                            Some((_, old_distance)) => {
+                                if distance_from_selection < old_distance {
+                                    closest_assist_fallback =
+                                        Some((assist_id, distance_from_selection));
+                                }
+                            }
+                            None => {
+                                closest_assist_fallback = Some((assist_id, distance_from_selection))
+                            }
+                        }
+                    }
                 }
+            }
+
+            if let Some((&assist_id, _)) = closest_assist_fallback {
+                self.focus_assist(assist_id, cx);
             }
         }
 
@@ -558,14 +625,6 @@ impl InlineAssistant {
         };
 
         match event {
-            EditorEvent::Saved => {
-                for assist_id in editor_assists.assist_ids.clone() {
-                    let assist = &self.assists[&assist_id];
-                    if let CodegenStatus::Done = &assist.codegen.read(cx).status {
-                        self.finish_assist(assist_id, false, cx)
-                    }
-                }
-            }
             EditorEvent::Edited { transaction_id } => {
                 let buffer = editor.read(cx).buffer().read(cx);
                 let edited_ranges =
@@ -866,12 +925,7 @@ impl InlineAssistant {
         assist
             .codegen
             .update(cx, |codegen, cx| {
-                codegen.start(
-                    assist.range.clone(),
-                    user_prompt,
-                    assistant_panel_context,
-                    cx,
-                )
+                codegen.start(user_prompt, assistant_panel_context, cx)
             })
             .log_err();
 
@@ -1055,6 +1109,7 @@ impl InlineAssistant {
                     editor.set_show_gutter(false, cx);
                     editor.scroll_manager.set_forbid_vertical_scroll(true);
                     editor.set_read_only(true);
+                    editor.set_show_inline_completions(false);
                     editor.highlight_rows::<DeletedLines>(
                         Anchor::min()..=Anchor::max(),
                         Some(cx.theme().status().deleted_background),
@@ -1228,12 +1283,6 @@ fn build_assist_editor_renderer(editor: &View<PromptEditor>) -> RenderBlock {
     })
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum InitialInsertion {
-    NewlineBefore,
-    NewlineAfter,
-}
-
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct InlineAssistId(usize);
 
@@ -1277,10 +1326,16 @@ struct PromptEditor {
     _codegen_subscription: Subscription,
     editor_subscriptions: Vec<Subscription>,
     pending_token_count: Task<Result<()>>,
-    token_count: Option<usize>,
+    token_counts: Option<TokenCounts>,
     _token_count_subscriptions: Vec<Subscription>,
     workspace: Option<WeakView<Workspace>>,
     show_rate_limit_notice: bool,
+}
+
+#[derive(Copy, Clone)]
+pub struct TokenCounts {
+    total: usize,
+    assistant_panel: usize,
 }
 
 impl EventEmitter<PromptEditorEvent> for PromptEditor {}
@@ -1528,7 +1583,7 @@ impl PromptEditor {
             codegen,
             fs,
             pending_token_count: Task::ready(Ok(())),
-            token_count: None,
+            token_counts: None,
             _token_count_subscriptions: token_count_subscriptions,
             workspace,
             show_rate_limit_notice: false,
@@ -1618,7 +1673,7 @@ impl PromptEditor {
                 .await?;
 
             this.update(&mut cx, |this, cx| {
-                this.token_count = Some(token_count);
+                this.token_counts = Some(token_count);
                 cx.notify();
             })
         })
@@ -1759,13 +1814,13 @@ impl PromptEditor {
 
     fn render_token_count(&self, cx: &mut ViewContext<Self>) -> Option<impl IntoElement> {
         let model = LanguageModelRegistry::read_global(cx).active_model()?;
-        let token_count = self.token_count?;
+        let token_counts = self.token_counts?;
         let max_token_count = model.max_token_count();
 
-        let remaining_tokens = max_token_count as isize - token_count as isize;
+        let remaining_tokens = max_token_count as isize - token_counts.total as isize;
         let token_count_color = if remaining_tokens <= 0 {
             Color::Error
-        } else if token_count as f32 / max_token_count as f32 >= 0.8 {
+        } else if token_counts.total as f32 / max_token_count as f32 >= 0.8 {
             Color::Warning
         } else {
             Color::Muted
@@ -1775,7 +1830,7 @@ impl PromptEditor {
             .id("token_count")
             .gap_0p5()
             .child(
-                Label::new(humanize_token_count(token_count))
+                Label::new(humanize_token_count(token_counts.total))
                     .size(LabelSize::Small)
                     .color(token_count_color),
             )
@@ -1787,11 +1842,14 @@ impl PromptEditor {
             );
         if let Some(workspace) = self.workspace.clone() {
             token_count = token_count
-                .tooltip(|cx| {
+                .tooltip(move |cx| {
                     Tooltip::with_meta(
-                        "Tokens Used by Inline Assistant",
+                        format!(
+                            "Tokens Used ({} from the Assistant Panel)",
+                            humanize_token_count(token_counts.assistant_panel)
+                        ),
                         None,
-                        "Click to Open Assistant Panel",
+                        "Click to open the Assistant Panel",
                         cx,
                     )
                 })
@@ -1808,7 +1866,7 @@ impl PromptEditor {
         } else {
             token_count = token_count
                 .cursor_default()
-                .tooltip(|cx| Tooltip::text("Tokens Used by Inline Assistant", cx));
+                .tooltip(|cx| Tooltip::text("Tokens used", cx));
         }
 
         Some(token_count)
@@ -2057,17 +2115,14 @@ impl InlineAssist {
         }
     }
 
-    pub fn count_tokens(&self, cx: &WindowContext) -> BoxFuture<'static, Result<usize>> {
+    pub fn count_tokens(&self, cx: &WindowContext) -> BoxFuture<'static, Result<TokenCounts>> {
         let Some(user_prompt) = self.user_prompt(cx) else {
             return future::ready(Err(anyhow!("no user prompt"))).boxed();
         };
         let assistant_panel_context = self.assistant_panel_context(cx);
-        self.codegen.read(cx).count_tokens(
-            self.range.clone(),
-            user_prompt,
-            assistant_panel_context,
-            cx,
-        )
+        self.codegen
+            .read(cx)
+            .count_tokens(user_prompt, assistant_panel_context, cx)
     }
 }
 
@@ -2088,6 +2143,8 @@ pub struct Codegen {
     buffer: Model<MultiBuffer>,
     old_buffer: Model<Buffer>,
     snapshot: MultiBufferSnapshot,
+    transform_range: Range<Anchor>,
+    selected_ranges: Vec<Range<Anchor>>,
     edit_position: Option<Anchor>,
     last_equal_ranges: Vec<Range<Anchor>>,
     initial_transaction_id: Option<TransactionId>,
@@ -2097,7 +2154,7 @@ pub struct Codegen {
     diff: Diff,
     telemetry: Option<Arc<Telemetry>>,
     _subscription: gpui::Subscription,
-    builder: Arc<PromptBuilder>,
+    prompt_builder: Arc<PromptBuilder>,
 }
 
 enum CodegenStatus {
@@ -2124,7 +2181,8 @@ impl EventEmitter<CodegenEvent> for Codegen {}
 impl Codegen {
     pub fn new(
         buffer: Model<MultiBuffer>,
-        range: Range<Anchor>,
+        transform_range: Range<Anchor>,
+        selected_ranges: Vec<Range<Anchor>>,
         initial_transaction_id: Option<TransactionId>,
         telemetry: Option<Arc<Telemetry>>,
         builder: Arc<PromptBuilder>,
@@ -2134,7 +2192,7 @@ impl Codegen {
 
         let (old_buffer, _, _) = buffer
             .read(cx)
-            .range_to_buffer_ranges(range.clone(), cx)
+            .range_to_buffer_ranges(transform_range.clone(), cx)
             .pop()
             .unwrap();
         let old_buffer = cx.new_model(|cx| {
@@ -2165,7 +2223,9 @@ impl Codegen {
             telemetry,
             _subscription: cx.subscribe(&buffer, Self::handle_buffer_event),
             initial_transaction_id,
-            builder,
+            prompt_builder: builder,
+            transform_range,
+            selected_ranges,
         }
     }
 
@@ -2190,15 +2250,27 @@ impl Codegen {
 
     pub fn count_tokens(
         &self,
-        edit_range: Range<Anchor>,
         user_prompt: String,
         assistant_panel_context: Option<LanguageModelRequest>,
         cx: &AppContext,
-    ) -> BoxFuture<'static, Result<usize>> {
+    ) -> BoxFuture<'static, Result<TokenCounts>> {
         if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
-            let request = self.build_request(user_prompt, assistant_panel_context, edit_range, cx);
+            let request = self.build_request(user_prompt, assistant_panel_context.clone(), cx);
             match request {
-                Ok(request) => model.count_tokens(request, cx),
+                Ok(request) => {
+                    let total_count = model.count_tokens(request.clone(), cx);
+                    let assistant_panel_count = assistant_panel_context
+                        .map(|context| model.count_tokens(context, cx))
+                        .unwrap_or_else(|| future::ready(Ok(0)).boxed());
+
+                    async move {
+                        Ok(TokenCounts {
+                            total: total_count.await?,
+                            assistant_panel: assistant_panel_count.await?,
+                        })
+                    }
+                    .boxed()
+                }
                 Err(error) => futures::future::ready(Err(error)).boxed(),
             }
         } else {
@@ -2208,7 +2280,6 @@ impl Codegen {
 
     pub fn start(
         &mut self,
-        edit_range: Range<Anchor>,
         user_prompt: String,
         assistant_panel_context: Option<LanguageModelRequest>,
         cx: &mut ModelContext<Self>,
@@ -2223,24 +2294,20 @@ impl Codegen {
             });
         }
 
-        self.edit_position = Some(edit_range.start.bias_right(&self.snapshot));
+        self.edit_position = Some(self.transform_range.start.bias_right(&self.snapshot));
 
         let telemetry_id = model.telemetry_id();
-        let chunks: LocalBoxFuture<Result<BoxStream<Result<String>>>> = if user_prompt
-            .trim()
-            .to_lowercase()
-            == "delete"
-        {
-            async { Ok(stream::empty().boxed()) }.boxed_local()
-        } else {
-            let request =
-                self.build_request(user_prompt, assistant_panel_context, edit_range.clone(), cx)?;
+        let chunks: LocalBoxFuture<Result<BoxStream<Result<String>>>> =
+            if user_prompt.trim().to_lowercase() == "delete" {
+                async { Ok(stream::empty().boxed()) }.boxed_local()
+            } else {
+                let request = self.build_request(user_prompt, assistant_panel_context, cx)?;
 
-            let chunks =
-                cx.spawn(|_, cx| async move { model.stream_completion(request, &cx).await });
-            async move { Ok(chunks.await?.boxed()) }.boxed_local()
-        };
-        self.handle_stream(telemetry_id, edit_range, chunks, cx);
+                let chunks =
+                    cx.spawn(|_, cx| async move { model.stream_completion(request, &cx).await });
+                async move { Ok(chunks.await?.boxed()) }.boxed_local()
+            };
+        self.handle_stream(telemetry_id, self.transform_range.clone(), chunks, cx);
         Ok(())
     }
 
@@ -2248,11 +2315,10 @@ impl Codegen {
         &self,
         user_prompt: String,
         assistant_panel_context: Option<LanguageModelRequest>,
-        edit_range: Range<Anchor>,
         cx: &AppContext,
     ) -> Result<LanguageModelRequest> {
         let buffer = self.buffer.read(cx).snapshot(cx);
-        let language = buffer.language_at(edit_range.start);
+        let language = buffer.language_at(self.transform_range.start);
         let language_name = if let Some(language) = language.as_ref() {
             if Arc::ptr_eq(language, &language::PLAIN_TEXT) {
                 None
@@ -2277,9 +2343,9 @@ impl Codegen {
         };
 
         let language_name = language_name.as_deref();
-        let start = buffer.point_to_buffer_offset(edit_range.start);
-        let end = buffer.point_to_buffer_offset(edit_range.end);
-        let (buffer, range) = if let Some((start, end)) = start.zip(end) {
+        let start = buffer.point_to_buffer_offset(self.transform_range.start);
+        let end = buffer.point_to_buffer_offset(self.transform_range.end);
+        let (transform_buffer, transform_range) = if let Some((start, end)) = start.zip(end) {
             let (start_buffer, start_buffer_offset) = start;
             let (end_buffer, end_buffer_offset) = end;
             if start_buffer.remote_id() == end_buffer.remote_id() {
@@ -2290,9 +2356,40 @@ impl Codegen {
         } else {
             return Err(anyhow::anyhow!("invalid transformation range"));
         };
+
+        let mut transform_context_range = transform_range.to_point(&transform_buffer);
+        transform_context_range.start.row = transform_context_range.start.row.saturating_sub(3);
+        transform_context_range.start.column = 0;
+        transform_context_range.end =
+            (transform_context_range.end + Point::new(3, 0)).min(transform_buffer.max_point());
+        transform_context_range.end.column =
+            transform_buffer.line_len(transform_context_range.end.row);
+        let transform_context_range = transform_context_range.to_offset(&transform_buffer);
+
+        let selected_ranges = self
+            .selected_ranges
+            .iter()
+            .filter_map(|selected_range| {
+                let start = buffer
+                    .point_to_buffer_offset(selected_range.start)
+                    .map(|(_, offset)| offset)?;
+                let end = buffer
+                    .point_to_buffer_offset(selected_range.end)
+                    .map(|(_, offset)| offset)?;
+                Some(start..end)
+            })
+            .collect::<Vec<_>>();
+
         let prompt = self
-            .builder
-            .generate_content_prompt(user_prompt, language_name, buffer, range)
+            .prompt_builder
+            .generate_content_prompt(
+                user_prompt,
+                language_name,
+                transform_buffer,
+                transform_range,
+                selected_ranges,
+                transform_context_range,
+            )
             .map_err(|e| anyhow::anyhow!("Failed to generate content prompt: {}", e))?;
 
         let mut messages = Vec::new();
@@ -2302,7 +2399,8 @@ impl Codegen {
 
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
-            content: prompt,
+            content: vec![prompt.into()],
+            cache: false,
         });
 
         Ok(LanguageModelRequest {
@@ -2349,12 +2447,12 @@ impl Codegen {
         self.diff = Diff::default();
         self.status = CodegenStatus::Pending;
         let mut edit_start = edit_range.start.to_offset(&snapshot);
-        self.generation = cx.spawn(|this, mut cx| {
+        self.generation = cx.spawn(|codegen, mut cx| {
             async move {
                 let chunks = stream.await;
                 let generate = async {
                     let (mut diff_tx, mut diff_rx) = mpsc::channel(1);
-                    let diff: Task<anyhow::Result<()>> =
+                    let line_based_stream_diff: Task<anyhow::Result<()>> =
                         cx.background_executor().spawn(async move {
                             let mut response_latency = None;
                             let request_start = Instant::now();
@@ -2364,84 +2462,19 @@ impl Codegen {
                                 let mut diff = StreamingDiff::new(selected_text.to_string());
                                 let mut line_diff = LineDiff::default();
 
-                                let mut new_text = String::new();
-                                let mut base_indent = None;
-                                let mut line_indent = None;
-                                let mut first_line = true;
-
                                 while let Some(chunk) = chunks.next().await {
                                     if response_latency.is_none() {
                                         response_latency = Some(request_start.elapsed());
                                     }
                                     let chunk = chunk?;
-
-                                    let mut lines = chunk.split('\n').peekable();
-                                    while let Some(line) = lines.next() {
-                                        new_text.push_str(line);
-                                        if line_indent.is_none() {
-                                            if let Some(non_whitespace_ch_ix) =
-                                                new_text.find(|ch: char| !ch.is_whitespace())
-                                            {
-                                                line_indent = Some(non_whitespace_ch_ix);
-                                                base_indent = base_indent.or(line_indent);
-
-                                                let line_indent = line_indent.unwrap();
-                                                let base_indent = base_indent.unwrap();
-                                                let indent_delta =
-                                                    line_indent as i32 - base_indent as i32;
-                                                let mut corrected_indent_len = cmp::max(
-                                                    0,
-                                                    suggested_line_indent.len as i32 + indent_delta,
-                                                )
-                                                    as usize;
-                                                if first_line {
-                                                    corrected_indent_len = corrected_indent_len
-                                                        .saturating_sub(
-                                                            selection_start.column as usize,
-                                                        );
-                                                }
-
-                                                let indent_char = suggested_line_indent.char();
-                                                let mut indent_buffer = [0; 4];
-                                                let indent_str =
-                                                    indent_char.encode_utf8(&mut indent_buffer);
-                                                new_text.replace_range(
-                                                    ..line_indent,
-                                                    &indent_str.repeat(corrected_indent_len),
-                                                );
-                                            }
-                                        }
-
-                                        if line_indent.is_some() {
-                                            let char_ops = diff.push_new(&new_text);
-                                            line_diff
-                                                .push_char_operations(&char_ops, &selected_text);
-                                            diff_tx
-                                                .send((char_ops, line_diff.line_operations()))
-                                                .await?;
-                                            new_text.clear();
-                                        }
-
-                                        if lines.peek().is_some() {
-                                            let char_ops = diff.push_new("\n");
-                                            line_diff
-                                                .push_char_operations(&char_ops, &selected_text);
-                                            diff_tx
-                                                .send((char_ops, line_diff.line_operations()))
-                                                .await?;
-                                            if line_indent.is_none() {
-                                                // Don't write out the leading indentation in empty lines on the next line
-                                                // This is the case where the above if statement didn't clear the buffer
-                                                new_text.clear();
-                                            }
-                                            line_indent = None;
-                                            first_line = false;
-                                        }
-                                    }
+                                    let char_ops = diff.push_new(&chunk);
+                                    line_diff.push_char_operations(&char_ops, &selected_text);
+                                    diff_tx
+                                        .send((char_ops, line_diff.line_operations()))
+                                        .await?;
                                 }
 
-                                let mut char_ops = diff.push_new(&new_text);
-                                char_ops.extend(diff.finish());
+                                let char_ops = diff.finish();
                                 line_diff.push_char_operations(&char_ops, &selected_text);
                                 line_diff.finish(&selected_text);
                                 diff_tx
@@ -2470,10 +2503,10 @@ impl Codegen {
                         });
 
                     while let Some((char_ops, line_diff)) = diff_rx.next().await {
-                        this.update(&mut cx, |this, cx| {
-                            this.last_equal_ranges.clear();
+                        codegen.update(&mut cx, |codegen, cx| {
+                            codegen.last_equal_ranges.clear();
 
-                            let transaction = this.buffer.update(cx, |buffer, cx| {
+                            let transaction = codegen.buffer.update(cx, |buffer, cx| {
                                 // Avoid grouping assistant edits with user edits.
                                 buffer.finalize_last_transaction(cx);
 
@@ -2498,23 +2531,24 @@ impl Codegen {
                                                 let edit_range = snapshot.anchor_after(edit_start)
                                                     ..snapshot.anchor_before(edit_end);
                                                 edit_start = edit_end;
-                                                this.last_equal_ranges.push(edit_range);
+                                                codegen.last_equal_ranges.push(edit_range);
                                                 None
                                             }
                                         }),
                                     None,
                                     cx,
                                 );
-                                this.edit_position = Some(snapshot.anchor_after(edit_start));
+                                codegen.edit_position = Some(snapshot.anchor_after(edit_start));
 
                                 buffer.end_transaction(cx)
                             });
 
                             if let Some(transaction) = transaction {
-                                if let Some(first_transaction) = this.transformation_transaction_id
+                                if let Some(first_transaction) =
+                                    codegen.transformation_transaction_id
                                 {
                                     // Group all assistant edits into the first transaction.
-                                    this.buffer.update(cx, |buffer, cx| {
+                                    codegen.buffer.update(cx, |buffer, cx| {
                                         buffer.merge_transactions(
                                             transaction,
                                             first_transaction,
@@ -2522,36 +2556,45 @@ impl Codegen {
                                         )
                                     });
                                 } else {
-                                    this.transformation_transaction_id = Some(transaction);
-                                    this.buffer.update(cx, |buffer, cx| {
+                                    codegen.transformation_transaction_id = Some(transaction);
+                                    codegen.buffer.update(cx, |buffer, cx| {
                                         buffer.finalize_last_transaction(cx)
                                     });
                                 }
                             }
 
-                            this.update_diff(edit_range.clone(), line_diff, cx);
+                            codegen.reapply_line_based_diff(edit_range.clone(), line_diff, cx);
 
                             cx.notify();
                         })?;
                     }
 
-                    diff.await?;
+                    // Streaming stopped and we have the new text in the buffer, and a line-based diff applied for the whole new buffer.
+                    // That diff is not what a regular diff is and might look unexpected, ergo apply a regular diff.
+                    // It's fine to apply even if the rest of the line diffing fails, as no more hunks are coming through `diff_rx`.
+                    let batch_diff_task = codegen.update(&mut cx, |codegen, cx| {
+                        codegen.reapply_batch_diff(edit_range.clone(), cx)
+                    })?;
+                    let (line_based_stream_diff, ()) =
+                        join!(line_based_stream_diff, batch_diff_task);
+                    line_based_stream_diff?;
 
                     anyhow::Ok(())
                 };
 
                 let result = generate.await;
-                this.update(&mut cx, |this, cx| {
-                    this.last_equal_ranges.clear();
-                    if let Err(error) = result {
-                        this.status = CodegenStatus::Error(error);
-                    } else {
-                        this.status = CodegenStatus::Done;
-                    }
-                    cx.emit(CodegenEvent::Finished);
-                    cx.notify();
-                })
-                .ok();
+                codegen
+                    .update(&mut cx, |this, cx| {
+                        this.last_equal_ranges.clear();
+                        if let Err(error) = result {
+                            this.status = CodegenStatus::Error(error);
+                        } else {
+                            this.status = CodegenStatus::Done;
+                        }
+                        cx.emit(CodegenEvent::Finished);
+                        cx.notify();
+                    })
+                    .ok();
             }
         });
         cx.notify();
@@ -2583,7 +2626,7 @@ impl Codegen {
         });
     }
 
-    fn update_diff(
+    fn reapply_line_based_diff(
         &mut self,
         edit_range: Range<Anchor>,
         line_operations: Vec<LineOperation>,
@@ -2641,6 +2684,99 @@ impl Codegen {
 
             cx.notify();
         }
+    }
+
+    fn reapply_batch_diff(
+        &mut self,
+        edit_range: Range<Anchor>,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<()> {
+        let old_snapshot = self.snapshot.clone();
+        let old_range = edit_range.to_point(&old_snapshot);
+        let new_snapshot = self.buffer.read(cx).snapshot(cx);
+        let new_range = edit_range.to_point(&new_snapshot);
+
+        cx.spawn(|codegen, mut cx| async move {
+            let (deleted_row_ranges, inserted_row_ranges) = cx
+                .background_executor()
+                .spawn(async move {
+                    let old_text = old_snapshot
+                        .text_for_range(
+                            Point::new(old_range.start.row, 0)
+                                ..Point::new(
+                                    old_range.end.row,
+                                    old_snapshot.line_len(MultiBufferRow(old_range.end.row)),
+                                ),
+                        )
+                        .collect::<String>();
+                    let new_text = new_snapshot
+                        .text_for_range(
+                            Point::new(new_range.start.row, 0)
+                                ..Point::new(
+                                    new_range.end.row,
+                                    new_snapshot.line_len(MultiBufferRow(new_range.end.row)),
+                                ),
+                        )
+                        .collect::<String>();
+
+                    let mut old_row = old_range.start.row;
+                    let mut new_row = new_range.start.row;
+                    let batch_diff =
+                        similar::TextDiff::from_lines(old_text.as_str(), new_text.as_str());
+
+                    let mut deleted_row_ranges: Vec<(Anchor, RangeInclusive<u32>)> = Vec::new();
+                    let mut inserted_row_ranges = Vec::new();
+                    for change in batch_diff.iter_all_changes() {
+                        let line_count = change.value().lines().count() as u32;
+                        match change.tag() {
+                            similar::ChangeTag::Equal => {
+                                old_row += line_count;
+                                new_row += line_count;
+                            }
+                            similar::ChangeTag::Delete => {
+                                let old_end_row = old_row + line_count - 1;
+                                let new_row = new_snapshot.anchor_before(Point::new(new_row, 0));
+
+                                if let Some((_, last_deleted_row_range)) =
+                                    deleted_row_ranges.last_mut()
+                                {
+                                    if *last_deleted_row_range.end() + 1 == old_row {
+                                        *last_deleted_row_range =
+                                            *last_deleted_row_range.start()..=old_end_row;
+                                    } else {
+                                        deleted_row_ranges.push((new_row, old_row..=old_end_row));
+                                    }
+                                } else {
+                                    deleted_row_ranges.push((new_row, old_row..=old_end_row));
+                                }
+
+                                old_row += line_count;
+                            }
+                            similar::ChangeTag::Insert => {
+                                let new_end_row = new_row + line_count - 1;
+                                let start = new_snapshot.anchor_before(Point::new(new_row, 0));
+                                let end = new_snapshot.anchor_before(Point::new(
+                                    new_end_row,
+                                    new_snapshot.line_len(MultiBufferRow(new_end_row)),
+                                ));
+                                inserted_row_ranges.push(start..=end);
+                                new_row += line_count;
+                            }
+                        }
+                    }
+
+                    (deleted_row_ranges, inserted_row_ranges)
+                })
+                .await;
+
+            codegen
+                .update(&mut cx, |codegen, cx| {
+                    codegen.diff.deleted_row_ranges = deleted_row_ranges;
+                    codegen.diff.inserted_row_ranges = inserted_row_ranges;
+                    cx.notify();
+                })
+                .ok();
+        })
     }
 }
 
@@ -2802,309 +2938,11 @@ fn merge_ranges(ranges: &mut Vec<Range<Anchor>>, buffer: &MultiBufferSnapshot) {
 mod tests {
     use super::*;
     use futures::stream::{self};
-    use gpui::{Context, TestAppContext};
-    use indoc::indoc;
-    use language::{
-        language_settings, tree_sitter_rust, Buffer, Language, LanguageConfig, LanguageMatcher,
-        Point,
-    };
-    use language_model::LanguageModelRegistry;
-    use rand::prelude::*;
     use serde::Serialize;
-    use settings::SettingsStore;
-    use std::{future, sync::Arc};
 
     #[derive(Serialize)]
     pub struct DummyCompletionRequest {
         pub name: String,
-    }
-
-    #[gpui::test(iterations = 10)]
-    async fn test_transform_autoindent(cx: &mut TestAppContext, mut rng: StdRng) {
-        cx.set_global(cx.update(SettingsStore::test));
-        cx.update(language_model::LanguageModelRegistry::test);
-        cx.update(language_settings::init);
-
-        let text = indoc! {"
-            fn main() {
-                let x = 0;
-                for _ in 0..10 {
-                    x += 1;
-                }
-            }
-        "};
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
-        let range = buffer.read_with(cx, |buffer, cx| {
-            let snapshot = buffer.snapshot(cx);
-            snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(4, 5))
-        });
-        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                range.clone(),
-                None,
-                None,
-                prompt_builder,
-                cx,
-            )
-        });
-
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                range,
-                future::ready(Ok(chunks_rx.map(|chunk| Ok(chunk)).boxed())),
-                cx,
-            )
-        });
-
-        let mut new_text = concat!(
-            "       let mut x = 0;\n",
-            "       while x < 10 {\n",
-            "           x += 1;\n",
-            "       }",
-        );
-        while !new_text.is_empty() {
-            let max_len = cmp::min(new_text.len(), 10);
-            let len = rng.gen_range(1..=max_len);
-            let (chunk, suffix) = new_text.split_at(len);
-            chunks_tx.unbounded_send(chunk.to_string()).unwrap();
-            new_text = suffix;
-            cx.background_executor.run_until_parked();
-        }
-        drop(chunks_tx);
-        cx.background_executor.run_until_parked();
-
-        assert_eq!(
-            buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx).text()),
-            indoc! {"
-                fn main() {
-                    let mut x = 0;
-                    while x < 10 {
-                        x += 1;
-                    }
-                }
-            "}
-        );
-    }
-
-    #[gpui::test(iterations = 10)]
-    async fn test_autoindent_when_generating_past_indentation(
-        cx: &mut TestAppContext,
-        mut rng: StdRng,
-    ) {
-        cx.set_global(cx.update(SettingsStore::test));
-        cx.update(language_settings::init);
-
-        let text = indoc! {"
-            fn main() {
-                le
-            }
-        "};
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
-        let range = buffer.read_with(cx, |buffer, cx| {
-            let snapshot = buffer.snapshot(cx);
-            snapshot.anchor_before(Point::new(1, 6))..snapshot.anchor_after(Point::new(1, 6))
-        });
-        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                range.clone(),
-                None,
-                None,
-                prompt_builder,
-                cx,
-            )
-        });
-
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                range.clone(),
-                future::ready(Ok(chunks_rx.map(|chunk| Ok(chunk)).boxed())),
-                cx,
-            )
-        });
-
-        cx.background_executor.run_until_parked();
-
-        let mut new_text = concat!(
-            "t mut x = 0;\n",
-            "while x < 10 {\n",
-            "    x += 1;\n",
-            "}", //
-        );
-        while !new_text.is_empty() {
-            let max_len = cmp::min(new_text.len(), 10);
-            let len = rng.gen_range(1..=max_len);
-            let (chunk, suffix) = new_text.split_at(len);
-            chunks_tx.unbounded_send(chunk.to_string()).unwrap();
-            new_text = suffix;
-            cx.background_executor.run_until_parked();
-        }
-        drop(chunks_tx);
-        cx.background_executor.run_until_parked();
-
-        assert_eq!(
-            buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx).text()),
-            indoc! {"
-                fn main() {
-                    let mut x = 0;
-                    while x < 10 {
-                        x += 1;
-                    }
-                }
-            "}
-        );
-    }
-
-    #[gpui::test(iterations = 10)]
-    async fn test_autoindent_when_generating_before_indentation(
-        cx: &mut TestAppContext,
-        mut rng: StdRng,
-    ) {
-        cx.update(LanguageModelRegistry::test);
-        cx.set_global(cx.update(SettingsStore::test));
-        cx.update(language_settings::init);
-
-        let text = concat!(
-            "fn main() {\n",
-            "  \n",
-            "}\n" //
-        );
-        let buffer =
-            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
-        let range = buffer.read_with(cx, |buffer, cx| {
-            let snapshot = buffer.snapshot(cx);
-            snapshot.anchor_before(Point::new(1, 2))..snapshot.anchor_after(Point::new(1, 2))
-        });
-        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                range.clone(),
-                None,
-                None,
-                prompt_builder,
-                cx,
-            )
-        });
-
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                range.clone(),
-                future::ready(Ok(chunks_rx.map(|chunk| Ok(chunk)).boxed())),
-                cx,
-            )
-        });
-
-        cx.background_executor.run_until_parked();
-
-        let mut new_text = concat!(
-            "let mut x = 0;\n",
-            "while x < 10 {\n",
-            "    x += 1;\n",
-            "}", //
-        );
-        while !new_text.is_empty() {
-            let max_len = cmp::min(new_text.len(), 10);
-            let len = rng.gen_range(1..=max_len);
-            let (chunk, suffix) = new_text.split_at(len);
-            chunks_tx.unbounded_send(chunk.to_string()).unwrap();
-            new_text = suffix;
-            cx.background_executor.run_until_parked();
-        }
-        drop(chunks_tx);
-        cx.background_executor.run_until_parked();
-
-        assert_eq!(
-            buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx).text()),
-            indoc! {"
-                fn main() {
-                    let mut x = 0;
-                    while x < 10 {
-                        x += 1;
-                    }
-                }
-            "}
-        );
-    }
-
-    #[gpui::test(iterations = 10)]
-    async fn test_autoindent_respects_tabs_in_selection(cx: &mut TestAppContext) {
-        cx.update(LanguageModelRegistry::test);
-        cx.set_global(cx.update(SettingsStore::test));
-        cx.update(language_settings::init);
-
-        let text = indoc! {"
-            func main() {
-            \tx := 0
-            \tfor i := 0; i < 10; i++ {
-            \t\tx++
-            \t}
-            }
-        "};
-        let buffer = cx.new_model(|cx| Buffer::local(text, cx));
-        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
-        let range = buffer.read_with(cx, |buffer, cx| {
-            let snapshot = buffer.snapshot(cx);
-            snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(4, 2))
-        });
-        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                range.clone(),
-                None,
-                None,
-                prompt_builder,
-                cx,
-            )
-        });
-
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                range.clone(),
-                future::ready(Ok(chunks_rx.map(|chunk| Ok(chunk)).boxed())),
-                cx,
-            )
-        });
-
-        let new_text = concat!(
-            "func main() {\n",
-            "\tx := 0\n",
-            "\tfor x < 10 {\n",
-            "\t\tx++\n",
-            "\t}", //
-        );
-        chunks_tx.unbounded_send(new_text.to_string()).unwrap();
-        drop(chunks_tx);
-        cx.background_executor.run_until_parked();
-
-        assert_eq!(
-            buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx).text()),
-            indoc! {"
-                func main() {
-                \tx := 0
-                \tfor x < 10 {
-                \t\tx++
-                \t}
-                }
-            "}
-        );
     }
 
     #[gpui::test]
@@ -3145,28 +2983,5 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         }
-    }
-
-    fn rust_lang() -> Language {
-        Language::new(
-            LanguageConfig {
-                name: "Rust".into(),
-                matcher: LanguageMatcher {
-                    path_suffixes: vec!["rs".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            Some(tree_sitter_rust::language()),
-        )
-        .with_indents_query(
-            r#"
-            (call_expression) @indent
-            (field_expression) @indent
-            (_ "(" ")" @end) @indent
-            (_ "{" "}" @end) @indent
-            "#,
-        )
-        .unwrap()
     }
 }

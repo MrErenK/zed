@@ -1,15 +1,15 @@
 use feature_flags::ZedPro;
+use gpui::Action;
 use gpui::DismissEvent;
 use language_model::{LanguageModel, LanguageModelAvailability, LanguageModelRegistry};
 use proto::Plan;
+use workspace::ShowConfiguration;
 
 use std::sync::Arc;
 use ui::ListItemSpacing;
 
 use crate::assistant_settings::AssistantSettings;
-use crate::ShowConfiguration;
 use fs::Fs;
-use gpui::Action;
 use gpui::SharedString;
 use gpui::Task;
 use picker::{Picker, PickerDelegate};
@@ -158,7 +158,7 @@ impl PickerDelegate for ModelPickerDelegate {
                     div().pr_1().child(
                         Icon::new(model_info.provider_icon)
                             .color(Color::Muted)
-                            .size(IconSize::XSmall),
+                            .size(IconSize::Medium),
                     ),
                 )
                 .child(
@@ -295,5 +295,6 @@ impl<T: PopoverTrigger> RenderOnce for ModelSelector<T> {
             .menu(move |_cx| Some(picker_view.clone()))
             .trigger(self.trigger)
             .attach(gpui::AnchorCorner::BottomLeft)
+            .when_some(self.handle, |menu, handle| menu.with_handle(handle))
     }
 }
