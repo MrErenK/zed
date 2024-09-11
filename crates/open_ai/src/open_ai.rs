@@ -68,6 +68,8 @@ pub enum Model {
     #[serde(rename = "custom")]
     Custom {
         name: String,
+        /// The name displayed in the UI, such as in the assistant panel model dropdown menu.
+        display_name: Option<String>,
         max_tokens: usize,
         max_output_tokens: Option<u32>,
     },
@@ -103,7 +105,9 @@ impl Model {
             Self::FourTurbo => "gpt-4-turbo",
             Self::FourOmni => "gpt-4o",
             Self::FourOmniMini => "gpt-4o-mini",
-            Self::Custom { name, .. } => name,
+            Self::Custom {
+                name, display_name, ..
+            } => display_name.as_ref().unwrap_or(name),
         }
     }
 
@@ -120,14 +124,10 @@ impl Model {
 
     pub fn max_output_tokens(&self) -> Option<u32> {
         match self {
-            Self::ThreePointFiveTurbo => Some(4096),
-            Self::Four => Some(8192),
-            Self::FourTurbo => Some(4096),
-            Self::FourOmni => Some(4096),
-            Self::FourOmniMini => Some(16384),
             Self::Custom {
                 max_output_tokens, ..
             } => *max_output_tokens,
+            _ => None,
         }
     }
 }

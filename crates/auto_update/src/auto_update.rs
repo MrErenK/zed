@@ -88,27 +88,58 @@ struct JsonRelease {
     url: String,
 }
 
-struct AutoUpdateSetting(bool);
+struct MacOsUnmounter {
+    mount_path: PathBuf,
+}
+
+impl Drop for MacOsUnmounter {
+    fn drop(&mut self) {
+        let unmount_output = std::process::Command::new("hdiutil")
+            .args(["detach", "-force"])
+            .arg(&self.mount_path)
+            .output();
+
+        match unmount_output {
+            Ok(output) if output.status.success() => {
+                log::info!("Successfully unmounted the disk image");
+            }
+            Ok(output) => {
+                log::error!(
+                    "Failed to unmount disk image: {:?}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                log::error!("Error while trying to unmount disk image: {:?}", error);
+            }
+        }
+    }
+}
 
 /// Whether or not to automatically check for updates.
-///
-/// Default: true
-#[derive(Clone, Copy, Default, JsonSchema, Deserialize, Serialize)]
+#[derive(Clone, Copy, JsonSchema, Deserialize, Serialize)]
+#[serde(default)]
 #[serde(transparent)]
-struct AutoUpdateSettingContent(bool);
+struct AutoUpdateSetting(bool);
+
+impl Default for AutoUpdateSetting {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 impl Settings for AutoUpdateSetting {
     const KEY: Option<&'static str> = Some("auto_update");
 
-    type FileContent = Option<AutoUpdateSettingContent>;
+    type FileContent = Self;
 
     fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
         let auto_update = [sources.release_channel, sources.user]
             .into_iter()
-            .find_map(|value| value.copied().flatten())
-            .unwrap_or(sources.default.ok_or_else(Self::missing_default)?);
+            .find_map(|value| value.copied())
+            .unwrap_or(*sources.default);
 
-        Ok(Self(auto_update.0))
+        Ok(auto_update)
     }
 }
 
@@ -183,7 +214,7 @@ pub fn check(_: &Check, cx: &mut WindowContext) {
         return;
     }
 
-    if let Some(message) = env::var("ZED_UPDATE_EXPLANATION").ok() {
+    if let Ok(message) = env::var("ZED_UPDATE_EXPLANATION") {
         drop(cx.prompt(
             gpui::PromptLevel::Info,
             "Zed was installed via a package manager.",
@@ -226,7 +257,7 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut AppContext) -> Option<(
         let url = &auto_updater
             .http_client
             .build_url(&format!("/releases/{release_channel}/{current_version}"));
-        cx.open_url(&url);
+        cx.open_url(url);
     }
 
     None
@@ -694,7 +725,7 @@ async fn install_release_linux(
     }
 
     let output = Command::new("rsync")
-        .args(&["-av", "--delete"])
+        .args(["-av", "--delete"])
         .arg(&from)
         .arg(&to)
         .output()
@@ -726,10 +757,10 @@ async fn install_release_macos(
 
     mounted_app_path.push("/");
     let output = Command::new("hdiutil")
-        .args(&["attach", "-nobrowse"])
+        .args(["attach", "-nobrowse"])
         .arg(&downloaded_dmg)
         .arg("-mountroot")
-        .arg(&temp_dir.path())
+        .arg(temp_dir.path())
         .output()
         .await?;
 
@@ -739,8 +770,13 @@ async fn install_release_macos(
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // Create an MacOsUnmounter that will be dropped (and thus unmount the disk) when this function exits
+    let _unmounter = MacOsUnmounter {
+        mount_path: mount_path.clone(),
+    };
+
     let output = Command::new("rsync")
-        .args(&["-av", "--delete"])
+        .args(["-av", "--delete"])
         .arg(&mounted_app_path)
         .arg(&running_app_path)
         .output()
@@ -749,18 +785,6 @@ async fn install_release_macos(
     anyhow::ensure!(
         output.status.success(),
         "failed to copy app: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let output = Command::new("hdiutil")
-        .args(&["detach"])
-        .arg(&mount_path)
-        .output()
-        .await?;
-
-    anyhow::ensure!(
-        output.status.success(),
-        "failed to unount: {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
 
