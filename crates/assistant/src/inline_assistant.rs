@@ -1,7 +1,7 @@
 use crate::{
     assistant_settings::AssistantSettings, humanize_token_count, prompts::PromptBuilder,
     AssistantPanel, AssistantPanelEvent, CharOperation, CycleNextInlineAssist,
-    CyclePreviousInlineAssist, LineDiff, LineOperation, ModelSelector, StreamingDiff,
+    CyclePreviousInlineAssist, LineDiff, LineOperation, ModelSelector, RequestType, StreamingDiff,
 };
 use anyhow::{anyhow, Context as _, Result};
 use client::{telemetry::Telemetry, ErrorExt};
@@ -9,7 +9,7 @@ use collections::{hash_map, HashMap, HashSet, VecDeque};
 use editor::{
     actions::{MoveDown, MoveUp, SelectAll},
     display_map::{
-        BlockContext, BlockDisposition, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
+        BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
         ToDisplayPoint,
     },
     Anchor, AnchorRangeExt, CodeActionProvider, Editor, EditorElement, EditorEvent, EditorMode,
@@ -21,9 +21,7 @@ use fs::Fs;
 use futures::{
     channel::mpsc,
     future::{BoxFuture, LocalBoxFuture},
-    join,
-    stream::{self, BoxStream},
-    SinkExt, Stream, StreamExt,
+    join, SinkExt, Stream, StreamExt,
 };
 use gpui::{
     anchored, deferred, point, AnyElement, AppContext, ClickEvent, EventEmitter, FocusHandle,
@@ -32,7 +30,8 @@ use gpui::{
 };
 use language::{Buffer, IndentKind, Point, Selection, TransactionId};
 use language_model::{
-    LanguageModel, LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage, Role,
+    logging::report_assistant_event, LanguageModel, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelTextStream, Role,
 };
 use multi_buffer::MultiBufferRow;
 use parking_lot::Mutex;
@@ -54,7 +53,7 @@ use telemetry_events::{AssistantEvent, AssistantKind, AssistantPhase};
 use terminal_view::terminal_panel::TerminalPanel;
 use text::{OffsetRangeExt, ToPoint as _};
 use theme::ThemeSettings;
-use ui::{prelude::*, CheckboxWithLabel, IconButtonShape, Popover, Tooltip};
+use ui::{prelude::*, text_for_action, CheckboxWithLabel, IconButtonShape, Popover, Tooltip};
 use util::{RangeExt, ResultExt};
 use workspace::{notifications::NotificationId, ItemHandle, Toast, Workspace};
 
@@ -189,11 +188,16 @@ impl InlineAssistant {
         initial_prompt: Option<String>,
         cx: &mut WindowContext,
     ) {
-        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        let (snapshot, initial_selections) = editor.update(cx, |editor, cx| {
+            (
+                editor.buffer().read(cx).snapshot(cx),
+                editor.selections.all::<Point>(cx),
+            )
+        });
 
         let mut selections = Vec::<Selection<Point>>::new();
         let mut newest_selection = None;
-        for mut selection in editor.read(cx).selections.all::<Point>(cx) {
+        for mut selection in initial_selections {
             if selection.end > selection.start {
                 selection.start.column = 0;
                 // If the selection ends at the start of the line, we don't want to include it.
@@ -236,12 +240,13 @@ impl InlineAssistant {
             };
             codegen_ranges.push(start..end);
 
-            if let Some(telemetry) = self.telemetry.as_ref() {
-                if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
+            if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
+                if let Some(telemetry) = self.telemetry.as_ref() {
                     telemetry.report_assistant_event(AssistantEvent {
                         conversation_id: None,
                         kind: AssistantKind::Inline,
                         phase: AssistantPhase::Invoked,
+                        message_id: None,
                         model: model.telemetry_id(),
                         model_provider: model.provider_id().to_string(),
                         response_latency: None,
@@ -446,15 +451,14 @@ impl InlineAssistant {
         let assist_blocks = vec![
             BlockProperties {
                 style: BlockStyle::Sticky,
-                position: range.start,
+                placement: BlockPlacement::Above(range.start),
                 height: prompt_editor_height,
                 render: build_assist_editor_renderer(prompt_editor),
-                disposition: BlockDisposition::Above,
                 priority: 0,
             },
             BlockProperties {
                 style: BlockStyle::Sticky,
-                position: range.end,
+                placement: BlockPlacement::Below(range.end),
                 height: 0,
                 render: Box::new(|cx| {
                     v_flex()
@@ -464,7 +468,6 @@ impl InlineAssistant {
                         .border_color(cx.theme().status().info_border)
                         .into_any_element()
                 }),
-                disposition: BlockDisposition::Below,
                 priority: 0,
             },
         ];
@@ -568,10 +571,13 @@ impl InlineAssistant {
             return;
         };
 
-        let editor = editor.read(cx);
-        if editor.selections.count() == 1 {
-            let selection = editor.selections.newest::<usize>(cx);
-            let buffer = editor.buffer().read(cx).snapshot(cx);
+        if editor.read(cx).selections.count() == 1 {
+            let (selection, buffer) = editor.update(cx, |editor, cx| {
+                (
+                    editor.selections.newest::<usize>(cx),
+                    editor.buffer().read(cx).snapshot(cx),
+                )
+            });
             for assist_id in &editor_assists.assist_ids {
                 let assist = &self.assists[assist_id];
                 let assist_range = assist.range.to_offset(&buffer);
@@ -596,10 +602,13 @@ impl InlineAssistant {
             return;
         };
 
-        let editor = editor.read(cx);
-        if editor.selections.count() == 1 {
-            let selection = editor.selections.newest::<usize>(cx);
-            let buffer = editor.buffer().read(cx).snapshot(cx);
+        if editor.read(cx).selections.count() == 1 {
+            let (selection, buffer) = editor.update(cx, |editor, cx| {
+                (
+                    editor.selections.newest::<usize>(cx),
+                    editor.buffer().read(cx).snapshot(cx),
+                )
+            });
             let mut closest_assist_fallback = None;
             for assist_id in &editor_assists.assist_ids {
                 let assist = &self.assists[assist_id];
@@ -745,33 +754,6 @@ impl InlineAssistant {
 
     pub fn finish_assist(&mut self, assist_id: InlineAssistId, undo: bool, cx: &mut WindowContext) {
         if let Some(assist) = self.assists.get(&assist_id) {
-            if let Some(telemetry) = self.telemetry.as_ref() {
-                if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
-                    let language_name = assist.editor.upgrade().and_then(|editor| {
-                        let multibuffer = editor.read(cx).buffer().read(cx);
-                        let ranges = multibuffer.range_to_buffer_ranges(assist.range.clone(), cx);
-                        ranges
-                            .first()
-                            .and_then(|(buffer, _, _)| buffer.read(cx).language())
-                            .map(|language| language.name())
-                    });
-                    telemetry.report_assistant_event(AssistantEvent {
-                        conversation_id: None,
-                        kind: AssistantKind::Inline,
-                        phase: if undo {
-                            AssistantPhase::Rejected
-                        } else {
-                            AssistantPhase::Accepted
-                        },
-                        model: model.telemetry_id(),
-                        model_provider: model.provider_id().to_string(),
-                        response_latency: None,
-                        error_message: None,
-                        language_name: language_name.map(|name| name.to_proto()),
-                    });
-                }
-            }
-
             let assist_group_id = assist.group_id;
             if self.assist_groups[&assist_group_id].linked {
                 for assist_id in self.unlink_assist_group(assist_group_id, cx) {
@@ -806,12 +788,45 @@ impl InlineAssistant {
                 }
             }
 
+            let active_alternative = assist.codegen.read(cx).active_alternative().clone();
+            let message_id = active_alternative.read(cx).message_id.clone();
+
+            if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
+                let language_name = assist.editor.upgrade().and_then(|editor| {
+                    let multibuffer = editor.read(cx).buffer().read(cx);
+                    let ranges = multibuffer.range_to_buffer_ranges(assist.range.clone(), cx);
+                    ranges
+                        .first()
+                        .and_then(|(buffer, _, _)| buffer.read(cx).language())
+                        .map(|language| language.name())
+                });
+                report_assistant_event(
+                    AssistantEvent {
+                        conversation_id: None,
+                        kind: AssistantKind::Inline,
+                        message_id,
+                        phase: if undo {
+                            AssistantPhase::Rejected
+                        } else {
+                            AssistantPhase::Accepted
+                        },
+                        model: model.telemetry_id(),
+                        model_provider: model.provider_id().to_string(),
+                        response_latency: None,
+                        error_message: None,
+                        language_name: language_name.map(|name| name.to_proto()),
+                    },
+                    self.telemetry.clone(),
+                    cx.http_client(),
+                    model.api_key(cx),
+                    cx.background_executor(),
+                );
+            }
+
             if undo {
                 assist.codegen.update(cx, |codegen, cx| codegen.undo(cx));
             } else {
-                let confirmed_alternative = assist.codegen.read(cx).active_alternative().clone();
-                self.confirmed_assists
-                    .insert(assist_id, confirmed_alternative);
+                self.confirmed_assists.insert(assist_id, active_alternative);
             }
         }
     }
@@ -1179,7 +1194,7 @@ impl InlineAssistant {
                 let height =
                     deleted_lines_editor.update(cx, |editor, cx| editor.max_point(cx).row().0 + 1);
                 new_blocks.push(BlockProperties {
-                    position: new_row,
+                    placement: BlockPlacement::Above(new_row),
                     height,
                     style: BlockStyle::Flex,
                     render: Box::new(move |cx| {
@@ -1191,7 +1206,6 @@ impl InlineAssistant {
                             .child(deleted_lines_editor.clone())
                             .into_any_element()
                     }),
-                    disposition: BlockDisposition::Above,
                     priority: 0,
                 });
             }
@@ -1599,7 +1613,7 @@ impl PromptEditor {
             // always show the cursor (even when it isn't focused) because
             // typing in one will make what you typed appear in all of them.
             editor.set_show_cursor_when_unfocused(true, cx);
-            editor.set_placeholder_text("Add a prompt…", cx);
+            editor.set_placeholder_text(Self::placeholder_text(codegen.read(cx), cx), cx);
             editor
         });
 
@@ -1656,6 +1670,7 @@ impl PromptEditor {
         self.editor = cx.new_view(|cx| {
             let mut editor = Editor::auto_height(Self::MAX_LINES as usize, cx);
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.set_placeholder_text(Self::placeholder_text(self.codegen.read(cx), cx), cx);
             editor.set_placeholder_text("Add a prompt…", cx);
             editor.set_text(prompt, cx);
             if focus {
@@ -1664,6 +1679,20 @@ impl PromptEditor {
             editor
         });
         self.subscribe_to_editor(cx);
+    }
+
+    fn placeholder_text(codegen: &Codegen, cx: &WindowContext) -> String {
+        let context_keybinding = text_for_action(&crate::ToggleFocus, cx)
+            .map(|keybinding| format!(" • {keybinding} for context"))
+            .unwrap_or_default();
+
+        let action = if codegen.is_insertion {
+            "Generate"
+        } else {
+            "Transform"
+        };
+
+        format!("{action}…{context_keybinding} • ↓↑ for history")
     }
 
     fn prompt(&self, cx: &AppContext) -> String {
@@ -2222,7 +2251,7 @@ impl InlineAssist {
                     .read(cx)
                     .active_context(cx)?
                     .read(cx)
-                    .to_completion_request(cx),
+                    .to_completion_request(RequestType::Chat, cx),
             )
         } else {
             None
@@ -2256,12 +2285,14 @@ pub enum CodegenEvent {
 pub struct Codegen {
     alternatives: Vec<Model<CodegenAlternative>>,
     active_alternative: usize,
+    seen_alternatives: HashSet<usize>,
     subscriptions: Vec<Subscription>,
     buffer: Model<MultiBuffer>,
     range: Range<Anchor>,
     initial_transaction_id: Option<TransactionId>,
     telemetry: Option<Arc<Telemetry>>,
     builder: Arc<PromptBuilder>,
+    is_insertion: bool,
 }
 
 impl Codegen {
@@ -2284,8 +2315,10 @@ impl Codegen {
             )
         });
         let mut this = Self {
+            is_insertion: range.to_offset(&buffer.read(cx).snapshot(cx)).is_empty(),
             alternatives: vec![codegen],
             active_alternative: 0,
+            seen_alternatives: HashSet::default(),
             subscriptions: Vec::new(),
             buffer,
             range,
@@ -2338,6 +2371,7 @@ impl Codegen {
     fn activate(&mut self, index: usize, cx: &mut ModelContext<Self>) {
         self.active_alternative()
             .update(cx, |codegen, cx| codegen.set_active(false, cx));
+        self.seen_alternatives.insert(index);
         self.active_alternative = index;
         self.active_alternative()
             .update(cx, |codegen, cx| codegen.set_active(true, cx));
@@ -2467,6 +2501,9 @@ pub struct CodegenAlternative {
     active: bool,
     edits: Vec<(Range<Anchor>, String)>,
     line_operations: Vec<LineOperation>,
+    request: Option<LanguageModelRequest>,
+    elapsed_time: Option<f64>,
+    message_id: Option<String>,
 }
 
 enum CodegenStatus {
@@ -2525,6 +2562,7 @@ impl CodegenAlternative {
             buffer: buffer.clone(),
             old_buffer,
             edit_position: None,
+            message_id: None,
             snapshot,
             last_equal_ranges: Default::default(),
             transformation_transaction_id: None,
@@ -2538,6 +2576,8 @@ impl CodegenAlternative {
             edits: Vec::new(),
             line_operations: Vec::new(),
             range,
+            request: None,
+            elapsed_time: None,
         }
     }
 
@@ -2627,19 +2667,20 @@ impl CodegenAlternative {
 
         self.edit_position = Some(self.range.start.bias_right(&self.snapshot));
 
+        let api_key = model.api_key(cx);
         let telemetry_id = model.telemetry_id();
         let provider_id = model.provider_id();
-        let chunks: LocalBoxFuture<Result<BoxStream<Result<String>>>> =
+        let stream: LocalBoxFuture<Result<LanguageModelTextStream>> =
             if user_prompt.trim().to_lowercase() == "delete" {
-                async { Ok(stream::empty().boxed()) }.boxed_local()
+                async { Ok(LanguageModelTextStream::default()) }.boxed_local()
             } else {
                 let request = self.build_request(user_prompt, assistant_panel_context, cx)?;
+                self.request = Some(request.clone());
 
-                let chunks = cx
-                    .spawn(|_, cx| async move { model.stream_completion_text(request, &cx).await });
-                async move { Ok(chunks.await?.boxed()) }.boxed_local()
+                cx.spawn(|_, cx| async move { model.stream_completion_text(request, &cx).await })
+                    .boxed_local()
             };
-        self.handle_stream(telemetry_id, provider_id.to_string(), chunks, cx);
+        self.handle_stream(telemetry_id, provider_id.to_string(), api_key, stream, cx);
         Ok(())
     }
 
@@ -2678,7 +2719,7 @@ impl CodegenAlternative {
 
         let prompt = self
             .builder
-            .generate_content_prompt(user_prompt, language_name, buffer, range)
+            .generate_inline_transformation_prompt(user_prompt, language_name, buffer, range)
             .map_err(|e| anyhow::anyhow!("Failed to generate content prompt: {}", e))?;
 
         let mut messages = Vec::new();
@@ -2704,9 +2745,11 @@ impl CodegenAlternative {
         &mut self,
         model_telemetry_id: String,
         model_provider_id: String,
-        stream: impl 'static + Future<Output = Result<BoxStream<'static, Result<String>>>>,
+        model_api_key: Option<String>,
+        stream: impl 'static + Future<Output = Result<LanguageModelTextStream>>,
         cx: &mut ModelContext<Self>,
     ) {
+        let start_time = Instant::now();
         let snapshot = self.snapshot.clone();
         let selected_text = snapshot
             .text_for_range(self.range.start..self.range.end)
@@ -2733,6 +2776,7 @@ impl CodegenAlternative {
             }
         }
 
+        let http_client = cx.http_client().clone();
         let telemetry = self.telemetry.clone();
         let language_name = {
             let multibuffer = self.buffer.read(cx);
@@ -2748,15 +2792,21 @@ impl CodegenAlternative {
         let mut edit_start = self.range.start.to_offset(&snapshot);
         self.generation = cx.spawn(|codegen, mut cx| {
             async move {
-                let chunks = stream.await;
+                let stream = stream.await;
+                let message_id = stream
+                    .as_ref()
+                    .ok()
+                    .and_then(|stream| stream.message_id.clone());
                 let generate = async {
                     let (mut diff_tx, mut diff_rx) = mpsc::channel(1);
+                    let executor = cx.background_executor().clone();
+                    let message_id = message_id.clone();
                     let line_based_stream_diff: Task<anyhow::Result<()>> =
                         cx.background_executor().spawn(async move {
                             let mut response_latency = None;
                             let request_start = Instant::now();
                             let diff = async {
-                                let chunks = StripInvalidSpans::new(chunks?);
+                                let chunks = StripInvalidSpans::new(stream?.stream);
                                 futures::pin_mut!(chunks);
                                 let mut diff = StreamingDiff::new(selected_text.to_string());
                                 let mut line_diff = LineDiff::default();
@@ -2852,9 +2902,10 @@ impl CodegenAlternative {
 
                             let error_message =
                                 result.as_ref().err().map(|error| error.to_string());
-                            if let Some(telemetry) = telemetry {
-                                telemetry.report_assistant_event(AssistantEvent {
+                            report_assistant_event(
+                                AssistantEvent {
                                     conversation_id: None,
+                                    message_id,
                                     kind: AssistantKind::Inline,
                                     phase: AssistantPhase::Response,
                                     model: model_telemetry_id,
@@ -2862,8 +2913,12 @@ impl CodegenAlternative {
                                     response_latency,
                                     error_message,
                                     language_name: language_name.map(|name| name.to_proto()),
-                                });
-                            }
+                                },
+                                telemetry,
+                                http_client,
+                                model_api_key,
+                                &executor,
+                            );
 
                             result?;
                             Ok(())
@@ -2923,14 +2978,18 @@ impl CodegenAlternative {
                 };
 
                 let result = generate.await;
+                let elapsed_time = start_time.elapsed().as_secs_f64();
+
                 codegen
                     .update(&mut cx, |this, cx| {
+                        this.message_id = message_id;
                         this.last_equal_ranges.clear();
                         if let Err(error) = result {
                             this.status = CodegenStatus::Error(error);
                         } else {
                             this.status = CodegenStatus::Done;
                         }
+                        this.elapsed_time = Some(elapsed_time);
                         cx.emit(CodegenEvent::Finished);
                         cx.notify();
                     })
@@ -3277,6 +3336,10 @@ impl CodeActionProvider for AssistantCodeActionProvider {
         range: Range<text::Anchor>,
         cx: &mut WindowContext,
     ) -> Task<Result<Vec<CodeAction>>> {
+        if !AssistantSettings::get_global(cx).enabled {
+            return Task::ready(Ok(Vec::new()));
+        }
+
         let snapshot = buffer.read(cx).snapshot();
         let mut range = range.to_point(&snapshot);
 
@@ -3471,15 +3534,7 @@ mod tests {
             )
         });
 
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                String::new(),
-                future::ready(Ok(chunks_rx.map(Ok).boxed())),
-                cx,
-            )
-        });
+        let chunks_tx = simulate_response_stream(codegen.clone(), cx);
 
         let mut new_text = concat!(
             "       let mut x = 0;\n",
@@ -3543,15 +3598,7 @@ mod tests {
             )
         });
 
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                String::new(),
-                future::ready(Ok(chunks_rx.map(Ok).boxed())),
-                cx,
-            )
-        });
+        let chunks_tx = simulate_response_stream(codegen.clone(), cx);
 
         cx.background_executor.run_until_parked();
 
@@ -3618,15 +3665,7 @@ mod tests {
             )
         });
 
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                String::new(),
-                future::ready(Ok(chunks_rx.map(Ok).boxed())),
-                cx,
-            )
-        });
+        let chunks_tx = simulate_response_stream(codegen.clone(), cx);
 
         cx.background_executor.run_until_parked();
 
@@ -3692,16 +3731,7 @@ mod tests {
             )
         });
 
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                String::new(),
-                future::ready(Ok(chunks_rx.map(Ok).boxed())),
-                cx,
-            )
-        });
-
+        let chunks_tx = simulate_response_stream(codegen.clone(), cx);
         let new_text = concat!(
             "func main() {\n",
             "\tx := 0\n",
@@ -3756,16 +3786,7 @@ mod tests {
             )
         });
 
-        let (chunks_tx, chunks_rx) = mpsc::unbounded();
-        codegen.update(cx, |codegen, cx| {
-            codegen.handle_stream(
-                String::new(),
-                String::new(),
-                future::ready(Ok(chunks_rx.map(Ok).boxed())),
-                cx,
-            )
-        });
-
+        let chunks_tx = simulate_response_stream(codegen.clone(), cx);
         chunks_tx
             .unbounded_send("let mut x = 0;\nx += 1;".to_string())
             .unwrap();
@@ -3837,6 +3858,26 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         }
+    }
+
+    fn simulate_response_stream(
+        codegen: Model<CodegenAlternative>,
+        cx: &mut TestAppContext,
+    ) -> mpsc::UnboundedSender<String> {
+        let (chunks_tx, chunks_rx) = mpsc::unbounded();
+        codegen.update(cx, |codegen, cx| {
+            codegen.handle_stream(
+                String::new(),
+                String::new(),
+                None,
+                future::ready(Ok(LanguageModelTextStream {
+                    message_id: None,
+                    stream: chunks_rx.map(Ok).boxed(),
+                })),
+                cx,
+            );
+        });
+        chunks_tx
     }
 
     fn rust_lang() -> Language {

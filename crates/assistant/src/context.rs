@@ -2,12 +2,13 @@
 mod context_tests;
 
 use crate::{
-    prompts::PromptBuilder, slash_command::SlashCommandLine, AssistantEdit, AssistantPatch,
-    AssistantPatchStatus, MessageId, MessageStatus,
+    prompts::PromptBuilder,
+    slash_command::{file_command::FileCommandMetadata, SlashCommandLine},
+    AssistantEdit, AssistantPatch, AssistantPatchStatus, MessageId, MessageStatus,
 };
 use anyhow::{anyhow, Context as _, Result};
 use assistant_slash_command::{
-    SlashCommandOutput, SlashCommandOutputSection, SlashCommandRegistry,
+    SlashCommandOutput, SlashCommandOutputSection, SlashCommandRegistry, SlashCommandResult,
 };
 use assistant_tool::ToolRegistry;
 use client::{self, proto, telemetry::Telemetry};
@@ -23,6 +24,7 @@ use gpui::{
 
 use language::{AnchorRangeExt, Bias, Buffer, LanguageRegistry, OffsetRangeExt, Point, ToOffset};
 use language_model::{
+    logging::report_assistant_event,
     provider::cloud::{MaxMonthlySpendReachedError, PaymentRequiredError},
     LanguageModel, LanguageModelCacheConfiguration, LanguageModelCompletionEvent,
     LanguageModelImage, LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
@@ -64,6 +66,14 @@ impl ContextId {
     pub fn to_proto(&self) -> String {
         self.0.clone()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestType {
+    /// Request a normal chat response from the model.
+    Chat,
+    /// Add a preamble to the message, which tells the model to return a structured response that suggests edits.
+    SuggestEdits,
 }
 
 #[derive(Clone, Debug)]
@@ -981,6 +991,20 @@ impl Context {
         &self.slash_command_output_sections
     }
 
+    pub fn contains_files(&self, cx: &AppContext) -> bool {
+        let buffer = self.buffer.read(cx);
+        self.slash_command_output_sections.iter().any(|section| {
+            section.is_valid(buffer)
+                && section
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        serde_json::from_value::<FileCommandMetadata>(metadata.clone()).ok()
+                    })
+                    .is_some()
+        })
+    }
+
     pub fn pending_tool_uses(&self) -> Vec<&PendingToolUse> {
         self.pending_tool_uses_by_id.values().collect()
     }
@@ -1028,7 +1052,7 @@ impl Context {
     }
 
     pub(crate) fn count_remaining_tokens(&mut self, cx: &mut ModelContext<Self>) {
-        let request = self.to_completion_request(cx);
+        let request = self.to_completion_request(RequestType::SuggestEdits, cx); // Conservatively assume SuggestEdits, since it takes more tokens.
         let Some(model) = LanguageModelRegistry::read_global(cx).active_model() else {
             return;
         };
@@ -1171,7 +1195,7 @@ impl Context {
         }
 
         let request = {
-            let mut req = self.to_completion_request(cx);
+            let mut req = self.to_completion_request(RequestType::Chat, cx);
             // Skip the last message because it's likely to change and
             // therefore would be a waste to cache.
             req.messages.pop();
@@ -1677,7 +1701,7 @@ impl Context {
     pub fn insert_command_output(
         &mut self,
         command_range: Range<language::Anchor>,
-        output: Task<Result<SlashCommandOutput>>,
+        output: Task<SlashCommandResult>,
         ensure_trailing_newline: bool,
         expand_result: bool,
         cx: &mut ModelContext<Self>,
@@ -1688,19 +1712,13 @@ impl Context {
             let command_range = command_range.clone();
             async move {
                 let output = output.await;
+                let output = match output {
+                    Ok(output) => SlashCommandOutput::from_event_stream(output).await,
+                    Err(err) => Err(err),
+                };
                 this.update(&mut cx, |this, cx| match output {
                     Ok(mut output) => {
-                        // Ensure section ranges are valid.
-                        for section in &mut output.sections {
-                            section.range.start = section.range.start.min(output.text.len());
-                            section.range.end = section.range.end.min(output.text.len());
-                            while !output.text.is_char_boundary(section.range.start) {
-                                section.range.start -= 1;
-                            }
-                            while !output.text.is_char_boundary(section.range.end) {
-                                section.range.end += 1;
-                            }
-                        }
+                        output.ensure_valid_section_ranges();
 
                         // Ensure there is a newline after the last section.
                         if ensure_trailing_newline {
@@ -1865,7 +1883,11 @@ impl Context {
         })
     }
 
-    pub fn assist(&mut self, cx: &mut ModelContext<Self>) -> Option<MessageAnchor> {
+    pub fn assist(
+        &mut self,
+        request_type: RequestType,
+        cx: &mut ModelContext<Self>,
+    ) -> Option<MessageAnchor> {
         let model_registry = LanguageModelRegistry::read_global(cx);
         let provider = model_registry.active_provider()?;
         let model = model_registry.active_model()?;
@@ -1878,7 +1900,7 @@ impl Context {
         // Compute which messages to cache, including the last one.
         self.mark_cache_anchors(&model.cache_configuration(), false, cx);
 
-        let mut request = self.to_completion_request(cx);
+        let mut request = self.to_completion_request(request_type, cx);
 
         if cx.has_flag::<ToolUseFeatureFlag>() {
             let tool_registry = ToolRegistry::global(cx);
@@ -1934,6 +1956,7 @@ impl Context {
                                     });
 
                                 match event {
+                                    LanguageModelCompletionEvent::StartMessage { .. } => {}
                                     LanguageModelCompletionEvent::Stop(reason) => {
                                         stop_reason = reason;
                                     }
@@ -2039,23 +2062,28 @@ impl Context {
                         None
                     };
 
-                    if let Some(telemetry) = this.telemetry.as_ref() {
-                        let language_name = this
-                            .buffer
-                            .read(cx)
-                            .language()
-                            .map(|language| language.name());
-                        telemetry.report_assistant_event(AssistantEvent {
+                    let language_name = this
+                        .buffer
+                        .read(cx)
+                        .language()
+                        .map(|language| language.name());
+                    report_assistant_event(
+                        AssistantEvent {
                             conversation_id: Some(this.id.0.clone()),
                             kind: AssistantKind::Panel,
                             phase: AssistantPhase::Response,
+                            message_id: None,
                             model: model.telemetry_id(),
                             model_provider: model.provider_id().to_string(),
                             response_latency,
                             error_message,
                             language_name: language_name.map(|name| name.to_proto()),
-                        });
-                    }
+                        },
+                        this.telemetry.clone(),
+                        cx.http_client(),
+                        model.api_key(cx),
+                        cx.background_executor(),
+                    );
 
                     if let Ok(stop_reason) = result {
                         match stop_reason {
@@ -2080,7 +2108,11 @@ impl Context {
         Some(user_message)
     }
 
-    pub fn to_completion_request(&self, cx: &AppContext) -> LanguageModelRequest {
+    pub fn to_completion_request(
+        &self,
+        request_type: RequestType,
+        cx: &AppContext,
+    ) -> LanguageModelRequest {
         let buffer = self.buffer.read(cx);
 
         let mut contents = self.contents(cx).peekable();
@@ -2167,6 +2199,25 @@ impl Context {
             );
 
             completion_request.messages.push(request_message);
+        }
+
+        if let RequestType::SuggestEdits = request_type {
+            if let Ok(preamble) = self.prompt_builder.generate_workflow_prompt() {
+                let last_elem_index = completion_request.messages.len();
+
+                completion_request
+                    .messages
+                    .push(LanguageModelRequestMessage {
+                        role: Role::User,
+                        content: vec![MessageContent::Text(preamble)],
+                        cache: false,
+                    });
+
+                // The preamble message should be sent right before the last actual user message.
+                completion_request
+                    .messages
+                    .swap(last_elem_index, last_elem_index.saturating_sub(1));
+            }
         }
 
         completion_request
@@ -2483,11 +2534,12 @@ impl Context {
                 return;
             }
 
-            let mut request = self.to_completion_request(cx);
+            let mut request = self.to_completion_request(RequestType::Chat, cx);
             request.messages.push(LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![
-                    "Summarize the context into a short title without punctuation.".into(),
+                    "Generate a concise 3-7 word title for this conversation, omitting punctuation"
+                        .into(),
                 ],
                 cache: false,
             });
@@ -2498,7 +2550,7 @@ impl Context {
                     let mut messages = stream.await?;
 
                     let mut replaced = !replace_old;
-                    while let Some(message) = messages.next().await {
+                    while let Some(message) = messages.stream.next().await {
                         let text = message?;
                         let mut lines = text.lines();
                         this.update(&mut cx, |this, cx| {

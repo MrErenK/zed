@@ -1,7 +1,7 @@
 use crate::{
     search::SearchQuery,
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
-    Item, NoRepositoryError, ProjectPath,
+    Item, ProjectPath,
 };
 use ::git::{parse_git_remote_url, BuildPermalinkParams, GitHostingProviderRegistry};
 use anyhow::{anyhow, Context as _, Result};
@@ -54,7 +54,7 @@ trait BufferStoreImpl {
 
     fn reload_buffers(
         &self,
-        buffers: Vec<Model<Buffer>>,
+        buffers: HashSet<Model<Buffer>>,
         push_to_history: bool,
         cx: &mut ModelContext<BufferStore>,
     ) -> Task<Result<ProjectTransaction>>;
@@ -392,7 +392,7 @@ impl BufferStoreImpl for Model<RemoteBufferStore> {
 
     fn reload_buffers(
         &self,
-        buffers: Vec<Model<Buffer>>,
+        buffers: HashSet<Model<Buffer>>,
         push_to_history: bool,
         cx: &mut ModelContext<BufferStore>,
     ) -> Task<Result<ProjectTransaction>> {
@@ -938,7 +938,7 @@ impl BufferStoreImpl for Model<LocalBufferStore> {
 
     fn reload_buffers(
         &self,
-        buffers: Vec<Model<Buffer>>,
+        buffers: HashSet<Model<Buffer>>,
         push_to_history: bool,
         cx: &mut ModelContext<BufferStore>,
     ) -> Task<Result<ProjectTransaction>> {
@@ -1118,7 +1118,7 @@ impl BufferStore {
         buffer: &Model<Buffer>,
         version: Option<clock::Global>,
         cx: &AppContext,
-    ) -> Task<Result<Blame>> {
+    ) -> Task<Result<Option<Blame>>> {
         let buffer = buffer.read(cx);
         let Some(file) = File::from_dyn(buffer.file()) else {
             return Task::ready(Err(anyhow!("buffer has no file")));
@@ -1130,7 +1130,7 @@ impl BufferStore {
                 let blame_params = maybe!({
                     let (repo_entry, local_repo_entry) = match worktree.repo_for_path(&file.path) {
                         Some(repo_for_path) => repo_for_path,
-                        None => anyhow::bail!(NoRepositoryError {}),
+                        None => return Ok(None),
                     };
 
                     let relative_path = repo_entry
@@ -1144,13 +1144,16 @@ impl BufferStore {
                         None => buffer.as_rope().clone(),
                     };
 
-                    anyhow::Ok((repo, relative_path, content))
+                    anyhow::Ok(Some((repo, relative_path, content)))
                 });
 
                 cx.background_executor().spawn(async move {
-                    let (repo, relative_path, content) = blame_params?;
+                    let Some((repo, relative_path, content)) = blame_params? else {
+                        return Ok(None);
+                    };
                     repo.blame(&relative_path, content)
                         .with_context(|| format!("Failed to blame {:?}", relative_path.0))
+                        .map(Some)
                 })
             }
             Worktree::Remote(worktree) => {
@@ -1894,13 +1897,10 @@ impl BufferStore {
         push_to_history: bool,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<ProjectTransaction>> {
-        let buffers: Vec<Model<Buffer>> = buffers
-            .into_iter()
-            .filter(|buffer| buffer.read(cx).is_dirty())
-            .collect();
         if buffers.is_empty() {
             return Task::ready(Ok(ProjectTransaction::default()));
         }
+
         self.state.reload_buffers(buffers, push_to_history, cx)
     }
 
@@ -2115,7 +2115,13 @@ fn is_not_found_error(error: &anyhow::Error) -> bool {
         .is_some_and(|err| err.kind() == io::ErrorKind::NotFound)
 }
 
-fn serialize_blame_buffer_response(blame: git::blame::Blame) -> proto::BlameBufferResponse {
+fn serialize_blame_buffer_response(blame: Option<git::blame::Blame>) -> proto::BlameBufferResponse {
+    let Some(blame) = blame else {
+        return proto::BlameBufferResponse {
+            blame_response: None,
+        };
+    };
+
     let entries = blame
         .entries
         .into_iter()
@@ -2157,14 +2163,19 @@ fn serialize_blame_buffer_response(blame: git::blame::Blame) -> proto::BlameBuff
         .collect::<Vec<_>>();
 
     proto::BlameBufferResponse {
-        entries,
-        messages,
-        permalinks,
-        remote_url: blame.remote_url,
+        blame_response: Some(proto::blame_buffer_response::BlameResponse {
+            entries,
+            messages,
+            permalinks,
+            remote_url: blame.remote_url,
+        }),
     }
 }
 
-fn deserialize_blame_buffer_response(response: proto::BlameBufferResponse) -> git::blame::Blame {
+fn deserialize_blame_buffer_response(
+    response: proto::BlameBufferResponse,
+) -> Option<git::blame::Blame> {
+    let response = response.blame_response?;
     let entries = response
         .entries
         .into_iter()
@@ -2205,10 +2216,10 @@ fn deserialize_blame_buffer_response(response: proto::BlameBufferResponse) -> gi
         })
         .collect::<HashMap<_, _>>();
 
-    Blame {
+    Some(Blame {
         entries,
         permalinks,
         messages,
         remote_url: response.remote_url,
-    }
+    })
 }

@@ -13,10 +13,11 @@ use crate::{
     terminal_inline_assistant::TerminalInlineAssistant,
     Assist, AssistantPatch, AssistantPatchStatus, CacheStatus, ConfirmCommand, Content, Context,
     ContextEvent, ContextId, ContextStore, ContextStoreEvent, CopyCode, CycleMessageRole,
-    DeployHistory, DeployPromptLibrary, InlineAssistant, InsertDraggedFiles, InsertIntoEditor,
-    Message, MessageId, MessageMetadata, MessageStatus, ModelPickerDelegate, ModelSelector,
-    NewContext, PendingSlashCommand, PendingSlashCommandStatus, QuoteSelection,
-    RemoteContextMetadata, SavedContextMetadata, Split, ToggleFocus, ToggleModelSelector,
+    DeployHistory, DeployPromptLibrary, Edit, InlineAssistant, InsertDraggedFiles,
+    InsertIntoEditor, Message, MessageId, MessageMetadata, MessageStatus, ModelPickerDelegate,
+    ModelSelector, NewContext, PendingSlashCommand, PendingSlashCommandStatus, QuoteSelection,
+    RemoteContextMetadata, RequestType, SavedContextMetadata, Split, ToggleFocus,
+    ToggleModelSelector,
 };
 use anyhow::Result;
 use assistant_slash_command::{SlashCommand, SlashCommandOutputSection};
@@ -26,8 +27,8 @@ use collections::{BTreeSet, HashMap, HashSet};
 use editor::{
     actions::{FoldAt, MoveToEndOfLine, Newline, ShowCompletions, UnfoldAt},
     display_map::{
-        BlockContext, BlockDisposition, BlockId, BlockProperties, BlockStyle, Crease,
-        CreaseMetadata, CustomBlockId, FoldId, RenderBlock, ToDisplayPoint,
+        BlockContext, BlockId, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseMetadata,
+        CustomBlockId, FoldId, RenderBlock, ToDisplayPoint,
     },
     scroll::{Autoscroll, AutoscrollStrategy},
     Anchor, Editor, EditorEvent, ProposedChangeLocation, ProposedChangesEditor, RowExt,
@@ -72,12 +73,11 @@ use std::{
 };
 use terminal_view::{terminal_panel::TerminalPanel, TerminalView};
 use text::SelectionGoal;
-use ui::TintColor;
 use ui::{
     prelude::*,
     utils::{format_distance_from_now, DateTimeType},
     Avatar, ButtonLike, ContextMenu, Disclosure, ElevationIndex, KeyBinding, ListItem,
-    ListItemSpacing, PopoverMenu, PopoverMenuHandle, Tooltip,
+    ListItemSpacing, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip,
 };
 use util::{maybe, ResultExt};
 use workspace::{
@@ -356,8 +356,10 @@ impl AssistantPanel {
             let project = workspace.project().clone();
             pane.set_custom_drop_handle(cx, move |_, dropped_item, cx| {
                 let action = maybe!({
-                    if let Some(paths) = dropped_item.downcast_ref::<ExternalPaths>() {
-                        return Some(InsertDraggedFiles::ExternalFiles(paths.paths().to_vec()));
+                    if project.read(cx).is_local() {
+                        if let Some(paths) = dropped_item.downcast_ref::<ExternalPaths>() {
+                            return Some(InsertDraggedFiles::ExternalFiles(paths.paths().to_vec()));
+                        }
                     }
 
                     let project_paths = if let Some(tab) = dropped_item.downcast_ref::<DraggedTab>()
@@ -961,7 +963,7 @@ impl AssistantPanel {
 
     fn new_context(&mut self, cx: &mut ViewContext<Self>) -> Option<View<ContextEditor>> {
         let project = self.project.read(cx);
-        if project.is_via_collab() && project.dev_server_project_id().is_none() {
+        if project.is_via_collab() {
             let task = self
                 .context_store
                 .update(cx, |store, cx| store.create_remote_context(cx));
@@ -1459,6 +1461,7 @@ type MessageHeader = MessageMetadata;
 
 #[derive(Clone)]
 enum AssistError {
+    FileRequired,
     PaymentRequired,
     MaxMonthlySpendReached,
     Message(SharedString),
@@ -1586,23 +1589,11 @@ impl ContextEditor {
     }
 
     fn assist(&mut self, _: &Assist, cx: &mut ViewContext<Self>) {
-        let provider = LanguageModelRegistry::read_global(cx).active_provider();
-        if provider
-            .as_ref()
-            .map_or(false, |provider| provider.must_accept_terms(cx))
-        {
-            self.show_accept_terms = true;
-            cx.notify();
-            return;
-        }
+        self.send_to_model(RequestType::Chat, cx);
+    }
 
-        if self.focus_active_patch(cx) {
-            return;
-        }
-
-        self.last_error = None;
-        self.send_to_model(cx);
-        cx.notify();
+    fn edit(&mut self, _: &Edit, cx: &mut ViewContext<Self>) {
+        self.send_to_model(RequestType::SuggestEdits, cx);
     }
 
     fn focus_active_patch(&mut self, cx: &mut ViewContext<Self>) -> bool {
@@ -1620,8 +1611,30 @@ impl ContextEditor {
         false
     }
 
-    fn send_to_model(&mut self, cx: &mut ViewContext<Self>) {
-        if let Some(user_message) = self.context.update(cx, |context, cx| context.assist(cx)) {
+    fn send_to_model(&mut self, request_type: RequestType, cx: &mut ViewContext<Self>) {
+        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+        if provider
+            .as_ref()
+            .map_or(false, |provider| provider.must_accept_terms(cx))
+        {
+            self.show_accept_terms = true;
+            cx.notify();
+            return;
+        }
+
+        if self.focus_active_patch(cx) {
+            return;
+        }
+
+        self.last_error = None;
+
+        if request_type == RequestType::SuggestEdits && !self.context.read(cx).contains_files(cx) {
+            self.last_error = Some(AssistError::FileRequired);
+            cx.notify();
+        } else if let Some(user_message) = self
+            .context
+            .update(cx, |context, cx| context.assist(request_type, cx))
+        {
             let new_selection = {
                 let cursor = user_message
                     .start
@@ -1638,6 +1651,8 @@ impl ContextEditor {
             // Avoid scrolling to the new cursor position so the assistant's output is stable.
             cx.defer(|this, _| this.scroll_position = None);
         }
+
+        cx.notify();
     }
 
     fn cancel(&mut self, _: &editor::actions::Cancel, cx: &mut ViewContext<Self>) {
@@ -1665,8 +1680,10 @@ impl ContextEditor {
         });
     }
 
-    fn cursors(&self, cx: &AppContext) -> Vec<usize> {
-        let selections = self.editor.read(cx).selections.all::<usize>(cx);
+    fn cursors(&self, cx: &mut WindowContext) -> Vec<usize> {
+        let selections = self
+            .editor
+            .update(cx, |editor, cx| editor.selections.all::<usize>(cx));
         selections
             .into_iter()
             .map(|selection| selection.head())
@@ -2007,13 +2024,12 @@ impl ContextEditor {
                             })
                             .map(|(command, error_message)| BlockProperties {
                                 style: BlockStyle::Fixed,
-                                position: Anchor {
+                                height: 1,
+                                placement: BlockPlacement::Below(Anchor {
                                     buffer_id: Some(buffer_id),
                                     excerpt_id,
                                     text_anchor: command.source_range.start,
-                                },
-                                height: 1,
-                                disposition: BlockDisposition::Below,
+                                }),
                                 render: slash_command_error_block_renderer(error_message),
                                 priority: 0,
                             }),
@@ -2219,6 +2235,7 @@ impl ContextEditor {
                     merge_adjacent: false,
                 };
 
+                let should_refold;
                 if let Some(state) = self.patches.get_mut(&range) {
                     replaced_blocks.insert(state.footer_block_id, render_block);
                     if let Some(editor_state) = &state.editor {
@@ -2233,14 +2250,16 @@ impl ContextEditor {
                             });
                         }
                     }
+
+                    should_refold =
+                        snapshot.intersects_fold(patch_start.to_offset(&snapshot.buffer_snapshot));
                 } else {
                     let block_ids = editor.insert_blocks(
                         [BlockProperties {
-                            position: patch_start,
                             height: path_count as u32 + 1,
                             style: BlockStyle::Flex,
                             render: render_block,
-                            disposition: BlockDisposition::Below,
+                            placement: BlockPlacement::Below(patch_start),
                             priority: 0,
                         }],
                         None,
@@ -2266,10 +2285,14 @@ impl ContextEditor {
                             update_task: None,
                         },
                     );
+
+                    should_refold = true;
                 }
 
-                editor.unfold_ranges([patch_start..patch_end], true, false, cx);
-                editor.fold_ranges([(patch_start..patch_end, header_placeholder)], false, cx);
+                if should_refold {
+                    editor.unfold_ranges([patch_start..patch_end], true, false, cx);
+                    editor.fold_ranges([(patch_start..patch_end, header_placeholder)], false, cx);
+                }
             }
 
             editor.remove_creases(removed_crease_ids, cx);
@@ -2367,7 +2390,9 @@ impl ContextEditor {
     }
 
     fn update_active_patch(&mut self, cx: &mut ViewContext<Self>) {
-        let newest_cursor = self.editor.read(cx).selections.newest::<Point>(cx).head();
+        let newest_cursor = self.editor.update(cx, |editor, cx| {
+            editor.selections.newest::<Point>(cx).head()
+        });
         let context = self.context.read(cx);
 
         let new_patch = context.patch_containing(newest_cursor, cx).cloned();
@@ -2721,12 +2746,13 @@ impl ContextEditor {
                 })
             };
             let create_block_properties = |message: &Message| BlockProperties {
-                position: buffer
-                    .anchor_in_excerpt(excerpt_id, message.anchor_range.start)
-                    .unwrap(),
                 height: 2,
                 style: BlockStyle::Sticky,
-                disposition: BlockDisposition::Above,
+                placement: BlockPlacement::Above(
+                    buffer
+                        .anchor_in_excerpt(excerpt_id, message.anchor_range.start)
+                        .unwrap(),
+                ),
                 priority: usize::MAX,
                 render: render_block(MessageMetadata::from(message)),
             };
@@ -2773,39 +2799,40 @@ impl ContextEditor {
     ) -> Option<(String, bool)> {
         const CODE_FENCE_DELIMITER: &'static str = "```";
 
-        let context_editor = context_editor_view.read(cx).editor.read(cx);
+        let context_editor = context_editor_view.read(cx).editor.clone();
+        context_editor.update(cx, |context_editor, cx| {
+            if context_editor.selections.newest::<Point>(cx).is_empty() {
+                let snapshot = context_editor.buffer().read(cx).snapshot(cx);
+                let (_, _, snapshot) = snapshot.as_singleton()?;
 
-        if context_editor.selections.newest::<Point>(cx).is_empty() {
-            let snapshot = context_editor.buffer().read(cx).snapshot(cx);
-            let (_, _, snapshot) = snapshot.as_singleton()?;
+                let head = context_editor.selections.newest::<Point>(cx).head();
+                let offset = snapshot.point_to_offset(head);
 
-            let head = context_editor.selections.newest::<Point>(cx).head();
-            let offset = snapshot.point_to_offset(head);
+                let surrounding_code_block_range = find_surrounding_code_block(snapshot, offset)?;
+                let mut text = snapshot
+                    .text_for_range(surrounding_code_block_range)
+                    .collect::<String>();
 
-            let surrounding_code_block_range = find_surrounding_code_block(snapshot, offset)?;
-            let mut text = snapshot
-                .text_for_range(surrounding_code_block_range)
-                .collect::<String>();
+                // If there is no newline trailing the closing three-backticks, then
+                // tree-sitter-md extends the range of the content node to include
+                // the backticks.
+                if text.ends_with(CODE_FENCE_DELIMITER) {
+                    text.drain((text.len() - CODE_FENCE_DELIMITER.len())..);
+                }
 
-            // If there is no newline trailing the closing three-backticks, then
-            // tree-sitter-md extends the range of the content node to include
-            // the backticks.
-            if text.ends_with(CODE_FENCE_DELIMITER) {
-                text.drain((text.len() - CODE_FENCE_DELIMITER.len())..);
+                (!text.is_empty()).then_some((text, true))
+            } else {
+                let anchor = context_editor.selections.newest_anchor();
+                let text = context_editor
+                    .buffer()
+                    .read(cx)
+                    .read(cx)
+                    .text_for_range(anchor.range())
+                    .collect::<String>();
+
+                (!text.is_empty()).then_some((text, false))
             }
-
-            (!text.is_empty()).then_some((text, true))
-        } else {
-            let anchor = context_editor.selections.newest_anchor();
-            let text = context_editor
-                .buffer()
-                .read(cx)
-                .read(cx)
-                .text_for_range(anchor.range())
-                .collect::<String>();
-
-            (!text.is_empty()).then_some((text, false))
-        }
+        })
     }
 
     fn insert_selection(
@@ -3362,7 +3389,7 @@ impl ContextEditor {
                     let anchor = buffer.anchor_in_excerpt(excerpt_id, anchor).unwrap();
                     let image = render_image.clone();
                     anchor.is_valid(&buffer).then(|| BlockProperties {
-                        position: anchor,
+                        placement: BlockPlacement::Above(anchor),
                         height: MAX_HEIGHT_IN_LINES,
                         style: BlockStyle::Sticky,
                         render: Box::new(move |cx| {
@@ -3383,8 +3410,6 @@ impl ContextEditor {
                                 )
                                 .into_any_element()
                         }),
-
-                        disposition: BlockDisposition::Above,
                         priority: 0,
                     })
                 })
@@ -3637,13 +3662,70 @@ impl ContextEditor {
                 button.tooltip(move |_| tooltip.clone())
             })
             .layer(ElevationIndex::ModalSurface)
-            .child(Label::new("Send"))
+            .child(Label::new(
+                if AssistantSettings::get_global(cx).are_live_diffs_enabled(cx) {
+                    "Chat"
+                } else {
+                    "Send"
+                },
+            ))
             .children(
                 KeyBinding::for_action_in(&Assist, &focus_handle, cx)
                     .map(|binding| binding.into_any_element()),
             )
             .on_click(move |_event, cx| {
                 focus_handle.dispatch_action(&Assist, cx);
+            })
+    }
+
+    fn render_edit_button(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle(cx).clone();
+
+        let (style, tooltip) = match token_state(&self.context, cx) {
+            Some(TokenState::NoTokensLeft { .. }) => (
+                ButtonStyle::Tinted(TintColor::Negative),
+                Some(Tooltip::text("Token limit reached", cx)),
+            ),
+            Some(TokenState::HasMoreTokens {
+                over_warn_threshold,
+                ..
+            }) => {
+                let (style, tooltip) = if over_warn_threshold {
+                    (
+                        ButtonStyle::Tinted(TintColor::Warning),
+                        Some(Tooltip::text("Token limit is close to exhaustion", cx)),
+                    )
+                } else {
+                    (ButtonStyle::Filled, None)
+                };
+                (style, tooltip)
+            }
+            None => (ButtonStyle::Filled, None),
+        };
+
+        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+
+        let has_configuration_error = configuration_error(cx).is_some();
+        let needs_to_accept_terms = self.show_accept_terms
+            && provider
+                .as_ref()
+                .map_or(false, |provider| provider.must_accept_terms(cx));
+        let disabled = has_configuration_error || needs_to_accept_terms;
+
+        ButtonLike::new("edit_button")
+            .disabled(disabled)
+            .style(style)
+            .when_some(tooltip, |button, tooltip| {
+                button.tooltip(move |_| tooltip.clone())
+            })
+            .layer(ElevationIndex::ModalSurface)
+            .child(Label::new("Suggest Edits"))
+            .children(
+                KeyBinding::for_action_in(&Edit, &focus_handle, cx)
+                    .map(|binding| binding.into_any_element()),
+            )
+            .on_click(move |_event, cx| {
+                focus_handle.dispatch_action(&Edit, cx);
             })
     }
 
@@ -3661,6 +3743,7 @@ impl ContextEditor {
                 .elevation_2(cx)
                 .occlude()
                 .child(match last_error {
+                    AssistError::FileRequired => self.render_file_required_error(cx),
                     AssistError::PaymentRequired => self.render_payment_required_error(cx),
                     AssistError::MaxMonthlySpendReached => {
                         self.render_max_monthly_spend_reached_error(cx)
@@ -3671,6 +3754,41 @@ impl ContextEditor {
                 })
                 .into_any(),
         )
+    }
+
+    fn render_file_required_error(&self, cx: &mut ViewContext<Self>) -> AnyElement {
+        v_flex()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(Icon::new(IconName::Warning).color(Color::Warning))
+                    .child(
+                        Label::new("Suggest Edits needs a file to edit").weight(FontWeight::MEDIUM),
+                    ),
+            )
+            .child(
+                div()
+                    .id("error-message")
+                    .max_h_24()
+                    .overflow_y_scroll()
+                    .child(Label::new(
+                        "To include files, type /file or /tab in your prompt.",
+                    )),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .mt_1()
+                    .child(Button::new("dismiss", "Dismiss").on_click(cx.listener(
+                        |this, _, cx| {
+                            this.last_error = None;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .into_any()
     }
 
     fn render_payment_required_error(&self, cx: &mut ViewContext<Self>) -> AnyElement {
@@ -3887,13 +4005,7 @@ impl Render for ContextEditor {
         } else {
             None
         };
-        let focus_handle = self
-            .workspace
-            .update(cx, |workspace, cx| {
-                Some(workspace.active_item_as::<Editor>(cx)?.focus_handle(cx))
-            })
-            .ok()
-            .flatten();
+
         v_flex()
             .key_context("ContextEditor")
             .capture_action(cx.listener(ContextEditor::cancel))
@@ -3903,6 +4015,7 @@ impl Render for ContextEditor {
             .capture_action(cx.listener(ContextEditor::paste))
             .capture_action(cx.listener(ContextEditor::cycle_message_role))
             .capture_action(cx.listener(ContextEditor::confirm_command))
+            .on_action(cx.listener(ContextEditor::edit))
             .on_action(cx.listener(ContextEditor::assist))
             .on_action(cx.listener(ContextEditor::split))
             .size_full()
@@ -3939,35 +4052,28 @@ impl Render for ContextEditor {
                         .bg(cx.theme().colors().editor_background)
                         .child(
                             h_flex()
-                                .gap_2()
-                                .child(render_inject_context_menu(cx.view().downgrade(), cx))
-                                .child(
-                                    IconButton::new("quote-button", IconName::Quote)
-                                        .icon_size(IconSize::Small)
-                                        .on_click(|_, cx| {
-                                            cx.dispatch_action(QuoteSelection.boxed_clone());
-                                        })
-                                        .tooltip(move |cx| {
-                                            cx.new_view(|cx| {
-                                                Tooltip::new("Insert Selection").key_binding(
-                                                    focus_handle.as_ref().and_then(|handle| {
-                                                        KeyBinding::for_action_in(
-                                                            &QuoteSelection,
-                                                            &handle,
-                                                            cx,
-                                                        )
-                                                    }),
-                                                )
-                                            })
-                                            .into()
-                                        }),
-                                ),
+                                .gap_1()
+                                .child(render_inject_context_menu(cx.view().downgrade(), cx)),
                         )
                         .child(
                             h_flex()
                                 .w_full()
                                 .justify_end()
-                                .child(div().child(self.render_send_button(cx))),
+                                .when(
+                                    AssistantSettings::get_global(cx).are_live_diffs_enabled(cx),
+                                    |buttons| {
+                                        buttons
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(self.render_edit_button(cx))
+                                            .child(
+                                                Label::new("or")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                    },
+                                )
+                                .child(self.render_send_button(cx)),
                         ),
                 ),
             )
@@ -4239,11 +4345,12 @@ fn render_inject_context_menu(
     slash_command_picker::SlashCommandSelector::new(
         commands.clone(),
         active_context_editor,
-        IconButton::new("trigger", IconName::SlashSquare)
+        Button::new("trigger", "Add Context")
+            .icon(IconName::Plus)
             .icon_size(IconSize::Small)
-            .tooltip(|cx| {
-                Tooltip::with_meta("Insert Context", None, "Type / to insert via keyboard", cx)
-            }),
+            .icon_color(Color::Muted)
+            .icon_position(IconPosition::Start)
+            .tooltip(|cx| Tooltip::text("Type / to insert via keyboard", cx)),
     )
 }
 
@@ -4416,7 +4523,7 @@ impl Render for ContextEditorToolbarItem {
                                                 .w_full()
                                                 .justify_between()
                                                 .gap_2()
-                                                .child(Label::new("Insert Context"))
+                                                .child(Label::new("Add Context"))
                                                 .child(Label::new("/ command").color(Color::Muted))
                                                 .into_any()
                                         },
@@ -4440,7 +4547,7 @@ impl Render for ContextEditorToolbarItem {
                                             }
                                         },
                                     )
-                                    .action("Insert Selection", QuoteSelection.boxed_clone())
+                                    .action("Add Selection", QuoteSelection.boxed_clone())
                             }))
                         }
                     }),
@@ -4700,7 +4807,7 @@ impl Render for ConfigurationView {
 
         let mut element = v_flex()
             .id("assistant-configuration-view")
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .bg(cx.theme().colors().editor_background)
             .size_full()
             .overflow_y_scroll()
