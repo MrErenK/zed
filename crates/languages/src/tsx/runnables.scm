@@ -8,10 +8,10 @@
                 object: [
                     (identifier) @_name
                     (member_expression object: (identifier) @_name)
-                ]*
+                ]
             )
         ]
-        (#any-of? @_name "it" "test" "describe")
+        (#any-of? @_name "it" "test" "describe" "context" "suite")
         arguments: (
             arguments . (string (string_fragment) @run)
         )

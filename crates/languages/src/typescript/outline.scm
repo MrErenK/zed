@@ -78,10 +78,10 @@
                 object: [
                     (identifier) @_name
                     (member_expression object: (identifier) @_name)
-                ]*
+                ]
             )
-        ]* @context
-        (#any-of? @_name "it" "test" "describe")
+        ] @context
+        (#any-of? @_name "it" "test" "describe" "context" "suite")
         arguments: (
             arguments . (string (string_fragment) @name)
         )
