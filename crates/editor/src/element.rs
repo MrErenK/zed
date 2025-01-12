@@ -73,7 +73,7 @@ use ui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::{RangeExt, ResultExt};
-use workspace::{item::Item, Workspace};
+use workspace::{item::Item, notifications::NotifyTaskExt, Workspace};
 
 struct SelectionLayout {
     head: DisplayPoint,
@@ -314,35 +314,41 @@ impl EditorElement {
         register_action(view, cx, Editor::go_to_next_hunk);
         register_action(view, cx, Editor::go_to_prev_hunk);
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_definition(a, cx).detach_and_log_err(cx);
+            editor.go_to_definition(a, cx).detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_definition_split(a, cx).detach_and_log_err(cx);
+            editor
+                .go_to_definition_split(a, cx)
+                .detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_declaration(a, cx).detach_and_log_err(cx);
+            editor.go_to_declaration(a, cx).detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_declaration_split(a, cx).detach_and_log_err(cx);
+            editor
+                .go_to_declaration_split(a, cx)
+                .detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_implementation(a, cx).detach_and_log_err(cx);
+            editor.go_to_implementation(a, cx).detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
             editor
                 .go_to_implementation_split(a, cx)
-                .detach_and_log_err(cx);
+                .detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
-            editor.go_to_type_definition(a, cx).detach_and_log_err(cx);
+            editor
+                .go_to_type_definition(a, cx)
+                .detach_and_notify_err(cx);
         });
         register_action(view, cx, |editor, a, cx| {
             editor
                 .go_to_type_definition_split(a, cx)
-                .detach_and_log_err(cx);
+                .detach_and_notify_err(cx);
         });
         register_action(view, cx, Editor::open_url);
-        register_action(view, cx, Editor::open_file);
+        register_action(view, cx, Editor::open_selected_filename);
         register_action(view, cx, Editor::fold);
         register_action(view, cx, Editor::fold_at_level);
         register_action(view, cx, Editor::fold_all);
@@ -382,14 +388,14 @@ impl EditorElement {
         register_action(view, cx, Editor::expand_all_hunk_diffs);
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.format(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.format_selections(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
@@ -399,42 +405,42 @@ impl EditorElement {
         register_action(view, cx, Editor::show_character_palette);
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.confirm_completion(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.compose_completion(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.confirm_code_action(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.rename(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.confirm_rename(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
         });
         register_action(view, cx, |editor, action, cx| {
             if let Some(task) = editor.find_all_references(action, cx) {
-                task.detach_and_log_err(cx);
+                task.detach_and_notify_err(cx);
             } else {
                 cx.propagate();
             }
@@ -3958,7 +3964,13 @@ impl EditorElement {
             let Some(()) = line.paint(hitbox.origin, line_height, cx).log_err() else {
                 continue;
             };
-            cx.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            // In singleton buffers, we select corresponding lines on the line number click, so use | -like cursor.
+            // In multi buffers, we open file at the line number clicked, so use a pointing hand cursor.
+            if is_singleton {
+                cx.set_cursor_style(CursorStyle::IBeam, hitbox);
+            } else {
+                cx.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            }
         }
     }
 
@@ -5578,21 +5590,21 @@ impl LineWithInvisibles {
                                     });
                                 }
                             } else {
-                                invisibles.extend(
-                                    line_chunk
-                                        .bytes()
-                                        .enumerate()
-                                        .filter(|(_, line_byte)| {
-                                            let is_whitespace =
-                                                (*line_byte as char).is_whitespace();
-                                            non_whitespace_added |= !is_whitespace;
-                                            is_whitespace
-                                                && (non_whitespace_added || !is_soft_wrapped)
-                                        })
-                                        .map(|(whitespace_index, _)| Invisible::Whitespace {
-                                            line_offset: line.len() + whitespace_index,
-                                        }),
-                                )
+                                invisibles.extend(line_chunk.char_indices().filter_map(
+                                    |(index, c)| {
+                                        let is_whitespace = c.is_whitespace();
+                                        non_whitespace_added |= !is_whitespace;
+                                        if is_whitespace
+                                            && (non_whitespace_added || !is_soft_wrapped)
+                                        {
+                                            Some(Invisible::Whitespace {
+                                                line_offset: line.len() + index,
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    },
+                                ))
                             }
                         }
 

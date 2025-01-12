@@ -4135,7 +4135,10 @@ async fn test_rename(cx: &mut gpui::TestAppContext) {
         .next()
         .await
         .unwrap();
-    let range = response.await.unwrap().unwrap();
+    let response = response.await.unwrap();
+    let PrepareRenameResponse::Success(range) = response else {
+        panic!("{:?}", response);
+    };
     let range = buffer.update(cx, |buffer, _| range.to_offset(buffer));
     assert_eq!(range, 6..9);
 
@@ -5657,9 +5660,9 @@ async fn search(
     query: SearchQuery,
     cx: &mut gpui::TestAppContext,
 ) -> Result<HashMap<String, Vec<Range<usize>>>> {
-    let mut search_rx = project.update(cx, |project, cx| project.search(query, cx));
+    let search_rx = project.update(cx, |project, cx| project.search(query, cx));
     let mut results = HashMap::default();
-    while let Some(search_result) = search_rx.next().await {
+    while let Ok(search_result) = search_rx.recv().await {
         match search_result {
             SearchResult::Buffer { buffer, ranges } => {
                 results.entry(buffer).or_insert(ranges);
